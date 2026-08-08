@@ -1,0 +1,63 @@
+# ==========================================
+# TrueWatch Git Ignore
+# ==========================================
+
+# Python virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Node
+node_modules/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Build files
+dist/
+build/
+.next/
+out/
+
+# Python testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# TrueWatch datasets
+data/
+
+# Generated reports
+reports/
+
+# Temporary files
+*.tmp
+*.temp
+venv/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.env
+.DS_Store

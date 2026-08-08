@@ -1,0 +1,21 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; }
+body { font-family: 'Inter', system-ui, sans-serif; background: #f8fafc; }
+
+@layer components {
+  .btn-primary  { @apply bg-primary text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-primaryDark transition-colors flex items-center gap-2 disabled:opacity-50; }
+  .btn-outline  { @apply bg-white text-slate-600 px-4 py-2 rounded-lg text-sm font-medium border border-slate-200 hover:bg-slate-50 transition-colors flex items-center gap-2; }
+  .btn-danger   { @apply bg-red-50 text-red-600 px-4 py-2 rounded-lg text-sm font-medium border border-red-200 hover:bg-red-100 transition-colors flex items-center gap-2; }
+  .card         { @apply bg-white border border-slate-200 rounded-xl overflow-hidden; }
+  .input        { @apply w-full px-3 py-2 border border-slate-200 rounded-lg text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary; }
+  .badge-green  { @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium bg-green-50 text-green-700; }
+  .badge-blue   { @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium bg-blue-50 text-blue-700; }
+  .badge-red    { @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium bg-red-50 text-red-700; }
+  .badge-amber  { @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium bg-amber-50 text-amber-700; }
+  .badge-purple { @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium bg-purple-50 text-purple-700; }
+  .badge-gray   { @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium bg-slate-100 text-slate-600; }
+}
