@@ -341,6 +341,12 @@ export default function ExamRoom() {
           logIncident('IDENTITY_MISMATCH', 1 - res.data.confidence, 'Face did not match registered identity')
         } else if (res.data.is_match === true) {
           setIdentityStatus('verified')
+        } else {
+          // is_match === null: genuinely inconclusive (no reference yet,
+          // or this one frame's face wasn't clearly detected). Don't leave
+          // the badge stuck on "Verifying…" — fall back to whatever we
+          // last knew, so a single bad frame doesn't look like a hang.
+          setIdentityStatus(prev => prev === 'verifying' ? 'pending' : prev)
         }
       }
       if (endpoint === '/object/detect' && res.data.detections?.length) {

@@ -427,10 +427,14 @@ def update_exam(exam_id):
     if "description"   in data: exam.description   = data["description"]
     if "duration_mins" in data: exam.duration_mins = data["duration_mins"]
     if "status"        in data: exam.status        = ExamStatus(data["status"])
-    if "start_time"    in data: exam.start_time    = datetime.fromisoformat(
-                                                         data["start_time"])
-    if "end_time"      in data: exam.end_time      = datetime.fromisoformat(
-                                                         data["end_time"])
+    # Empty-string values are legitimate here — the edit form always sends
+    # the full object back, including unset date fields as "". A key being
+    # *present* doesn't mean it has a real value; treat empty as "clear the
+    # date" (None) instead of handing '' to fromisoformat(), which raises.
+    if "start_time" in data:
+        exam.start_time = datetime.fromisoformat(data["start_time"]) if data["start_time"] else None
+    if "end_time" in data:
+        exam.end_time = datetime.fromisoformat(data["end_time"]) if data["end_time"] else None
     db.session.commit()
 
     enrolled_count = sync_batch_enrollment(exam)
@@ -1046,8 +1050,8 @@ def check_plagiarism():
     file          = request.files['file']
     session_token = request.form.get("session_token", "")
     fname         = file.filename
-    fpath         = os.path.join("os.path.join", fname)
-    os.makedirs("os.path.join", exist_ok=True)
+    fpath         = os.path.join("data/uploads", fname)
+    os.makedirs("data/uploads", exist_ok=True)
     file.save(fpath)
 
     from modules.nlp.plagiarism_detector import PlagiarismDetector
@@ -1309,7 +1313,8 @@ def register_identity():
     using the same file convention as the desktop app's
     IdentityVerifier, so either client can register or verify.
     """
-    import base64
+    import base64, cv2, numpy as np
+    from modules.vision.face_cropper import crop_face
     user, err = require_auth(roles=["student"])
     if err: return err
 
@@ -1321,12 +1326,30 @@ def register_identity():
     if "," in image_b64:
         image_b64 = image_b64.split(",")[1]
 
+    img_bytes = base64.b64decode(image_b64)
+    nparr     = np.frombuffer(img_bytes, np.uint8)
+    frame     = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    try:
+        face_crop = crop_face(frame)
+    except FileNotFoundError as e:
+        print(f"[identity/register] {e}")
+        return jsonify({"error": "Face verification model unavailable — contact support"}), 500
+
+    if face_crop is None:
+        # This was previously unchecked — a photo with no clear face could
+        # be saved as the reference, guaranteeing every later verify call
+        # would fail against it regardless of who was on camera.
+        return jsonify({"error": "No clear face detected in that photo — try again with better lighting, facing the camera directly."}), 400
+
     ref_dir  = "data/identity_references"
     os.makedirs(ref_dir, exist_ok=True)
     ref_path = os.path.join(ref_dir, f"student_{user.id}_ref.jpg")
 
-    with open(ref_path, "wb") as f:
-        f.write(base64.b64decode(image_b64))
+    # Store the tight crop, not the full frame — this is what verify will
+    # be compared against, and a pre-cropped reference gives ArcFace a
+    # cleaner, more consistent input than a full webcam frame would.
+    cv2.imwrite(ref_path, face_crop)
 
     return jsonify({"status": "registered", "path": ref_path})
 
@@ -1392,7 +1415,8 @@ def verify_identity_snapshot():
     Browser posts a base64 snapshot periodically during the exam.
     Compares it against the student's registered reference photo.
     """
-    import base64, tempfile
+    import base64, cv2, numpy as np
+    from modules.vision.face_cropper import crop_face
     user, err = require_auth(roles=["student"])
     if err: return err
 
@@ -1406,32 +1430,38 @@ def verify_identity_snapshot():
     if not os.path.exists(ref_path):
         return jsonify({"is_match": None, "confidence": 0.0, "note": "No reference registered"})
 
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        tmp.write(base64.b64decode(image_b64))
-        tmp_path = tmp.name
+    img_bytes = base64.b64decode(image_b64)
+    nparr     = np.frombuffer(img_bytes, np.uint8)
+    frame     = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    try:
+        face_crop = crop_face(frame)
+    except FileNotFoundError as e:
+        print(f"[identity/verify] {e}")
+        return jsonify({"is_match": None, "confidence": 0.0, "note": "Face verification model unavailable"})
+
+    if face_crop is None:
+        # No face found by the landmarker — genuinely inconclusive, not the
+        # same as "identity confirmed". A different, unregistered face is
+        # at least as likely to fail detection as the right one is.
+        return jsonify({"is_match": None, "confidence": 0.0, "note": "Face not clearly detected — check skipped"})
 
     try:
         from deepface import DeepFace
+        # detector_backend="skip" + enforce_detection=False: we've already
+        # located and cropped the face with the landmarker, so DeepFace only
+        # has to run ArcFace's recognition embedding, not its own (weaker,
+        # Haar-cascade based) detection pass — this was the actual source
+        # of most "inconclusive" results before.
         result = DeepFace.verify(
-            img1_path=tmp_path, img2_path=ref_path,
-            model_name="ArcFace", detector_backend="opencv",
-            distance_metric="cosine", enforce_detection=True,
+            img1_path=face_crop, img2_path=ref_path,
+            model_name="ArcFace", detector_backend="skip",
+            distance_metric="cosine", enforce_detection=False,
         )
         is_match   = result["verified"]
         distance   = result["distance"]
         confidence = max(0.0, 1.0 - (distance / 0.68))
         note = None
-    except ValueError as e:
-        # DeepFace raises ValueError specifically when it can't detect a
-        # face in one of the two images (bad angle, low light, motion
-        # blur — common with compressed webcam snapshots). This is NOT
-        # the same as "identity confirmed" — a different, unregistered
-        # face is at least as likely to fail detection as the right one
-        # is. Report it as inconclusive (is_match=None) instead of
-        # silently treating every failed check as a pass.
-        is_match, distance, confidence = None, None, 0.0
-        note = "Face not clearly detected — check skipped"
-        print(f"[identity/verify] face not detected: {e}")
     except Exception as e:
         # Any other unexpected error (model load failure, corrupt image,
         # etc.) — also inconclusive, and logged loudly so it doesn't go
@@ -1439,8 +1469,6 @@ def verify_identity_snapshot():
         is_match, distance, confidence = None, None, 0.0
         note = "Verification error — check skipped"
         print(f"[identity/verify] error: {e}")
-    finally:
-        os.unlink(tmp_path)
 
     ps = proctoring_sessions.get(token)
     # Only persist a real IdentityCheck row when we actually reached a

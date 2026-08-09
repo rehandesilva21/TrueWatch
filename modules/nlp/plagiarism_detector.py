@@ -8,6 +8,13 @@ from modules.nlp.document_parser import (
     split_into_chunks, remove_stopwords
 )
 
+try:
+    from modules.nlp.plagiarism_classifier import load_classifier, predict_best_match
+    _CLASSIFIER_IMPORTED = True
+except Exception as e:
+    print(f"Plagiarism classifier unavailable ({e}) — falling back to TF-IDF + semantic only.")
+    _CLASSIFIER_IMPORTED = False
+
 # ─── Corpus manager ────────────────────────────────────────────
 CORPUS_PATH = "data/corpus"
 
@@ -148,6 +155,19 @@ class PlagiarismDetector:
         self.tfidf_checker    = TFIDFChecker()
         self.semantic_checker = SemanticChecker()
 
+        # Trained binary classifier (Clough & Stevenson corpus, 96.8%
+        # leave-one-task-out accuracy) — loading the pickled model itself is
+        # cheap; the heavy sentence-transformer it needs for one of its
+        # features is lazy-loaded separately inside plagiarism_classifier.py.
+        self.classifier_available = False
+        if _CLASSIFIER_IMPORTED:
+            try:
+                load_classifier()
+                self.classifier_available = True
+            except Exception as e:
+                print(f"Could not load plagiarism classifier ({e}) — "
+                      f"continuing with TF-IDF + semantic only.")
+
     def analyze(self, file_path, use_semantic=True):
         """
         Full plagiarism analysis pipeline.
@@ -176,7 +196,14 @@ class PlagiarismDetector:
                 "word_count":     word_count,
                 "sentence_count": len(sentences),
                 "originality":    100.0,
-                "risk_level":     "No corpus",
+                # Must be a real RiskLevel value ("LOW"/"MEDIUM"/"HIGH"/
+                # "CRITICAL") — check_plagiarism() in api.py constructs
+                # RiskLevel(report["risk_level"]) for the DB row, and a
+                # non-member string here throws a 500 at save time. Nothing
+                # empty-corpus-specific is at risk of being lost since the
+                # summary text below already explains why originality is
+                # 100% — there's simply nothing to compare against yet.
+                "risk_level":     "LOW",
                 "tfidf_matches":  [],
                 "semantic_matches": [],
                 "summary":        "No reference documents in corpus to compare against.",
@@ -197,6 +224,17 @@ class PlagiarismDetector:
             )
             print(f"Found {len(semantic_matches)} suspicious passages")
 
+        # ── Trained classifier check ────────────────────────
+        classifier_source, classifier_prob = None, 0.0
+        if self.classifier_available:
+            print("Running trained classifier check...")
+            try:
+                classifier_source, classifier_prob = predict_best_match(clean, corpus)
+                print(f"Classifier: {classifier_prob:.1%} plagiarized "
+                      f"(best match: {classifier_source})")
+            except Exception as e:
+                print(f"Classifier check error: {e}")
+
         # ── Calculate originality score ────────────────────
         # TF-IDF direct score
         tfidf_penalty = max_tfidf * 100
@@ -207,10 +245,19 @@ class PlagiarismDetector:
             (len(semantic_matches) * 6) + (top_sem_score * 40), 80
         )
 
-        # Final score: weighted combination
-        plagiarism_score = min(
-            (tfidf_penalty * 0.5) + (semantic_penalty * 0.5), 100
-        )
+        if self.classifier_available:
+            # Trained model gets the largest weight — it's the only signal
+            # here that's been cross-validated against ground truth (96.8%
+            # leave-one-task-out accuracy) rather than hand-tuned.
+            classifier_penalty = classifier_prob * 100
+            plagiarism_score = min(
+                (tfidf_penalty * 0.3) + (semantic_penalty * 0.3) + (classifier_penalty * 0.4),
+                100
+            )
+        else:
+            plagiarism_score = min(
+                (tfidf_penalty * 0.5) + (semantic_penalty * 0.5), 100
+            )
         originality = round(100 - plagiarism_score, 1)
 
         # ── Risk level ─────────────────────────────────────
@@ -235,11 +282,17 @@ class PlagiarismDetector:
                 for name, score in top_tfidf
             ],
             "semantic_matches": semantic_matches[:10],  # top 10
+            "classifier_match": (
+                {"source": classifier_source, "probability": round(classifier_prob * 100, 1)}
+                if classifier_source else None
+            ),
             "summary": (
                 f"Document is {originality}% original. "
                 f"Risk level: {risk}. "
                 f"Top TF-IDF match: {round(max_tfidf * 100, 1)}%. "
                 f"Suspicious passages found: {len(semantic_matches)}."
+                + (f" Trained classifier: {round(classifier_prob * 100, 1)}% plagiarized."
+                   if self.classifier_available else "")
             )
         }
 
@@ -249,6 +302,8 @@ class PlagiarismDetector:
         print(f"  Risk level   : {risk}")
         print(f"  TF-IDF match : {round(max_tfidf * 100, 1)}%")
         print(f"  Suspicious   : {len(semantic_matches)} passages")
+        if self.classifier_available:
+            print(f"  Classifier   : {round(classifier_prob * 100, 1)}% plagiarized")
 
         if semantic_matches:
             print(f"\nTop suspicious passage:")

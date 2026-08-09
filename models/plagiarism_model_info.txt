@@ -1,0 +1,4 @@
+model: LightGBM
+leave_one_task_out_accuracy_binary: 0.9684
+leave_one_task_out_accuracy_3class:  0.8526
+leave_one_task_out_accuracy_4class:  0.7684
