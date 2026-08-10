@@ -8,7 +8,15 @@ export default function Results() {
   const [exams,    setExams]    = useState([])
   const [filter,   setFilter]   = useState('')
   const [loading,  setLoading]  = useState(true)
+  const [rechecking, setRechecking] = useState(false)
+  const [recheckMsg,  setRecheckMsg]  = useState('')
   const navigate = useNavigate()
+
+  const loadSessions = () => {
+    API.get('/lecturer/sessions')
+      .then(res => setSessions(res.data.sessions))
+      .catch(console.error)
+  }
 
   useEffect(() => {
     Promise.all([API.get('/lecturer/sessions'), API.get('/exams')])
@@ -25,6 +33,27 @@ export default function Results() {
     : sessions
 
   const ungraded = filtered.filter(s => s.grade == null && s.result !== 'pending')
+
+  const recheckPlagiarism = async () => {
+    if (!filter) return
+    setRechecking(true)
+    setRecheckMsg('')
+    try {
+      const res = await API.post(`/exams/${filter}/plagiarism/recheck`)
+      const { updated, skipped } = res.data
+      setRecheckMsg(
+        skipped?.length > 0
+          ? `Re-checked ${updated} submission${updated !== 1 ? 's' : ''}, ${skipped.length} skipped (file missing or unreadable).`
+          : `Re-checked ${updated} submission${updated !== 1 ? 's' : ''} — scores updated below.`
+      )
+      loadSessions()
+    } catch (err) {
+      console.error(err)
+      setRecheckMsg(err.response?.data?.error || 'Re-check failed')
+    } finally {
+      setRechecking(false)
+    }
+  }
 
   return (
     <Layout>
@@ -44,6 +73,19 @@ export default function Results() {
             {exams.map(e => <option key={e.id} value={e.id}>{e.title}</option>)}
           </select>
         </div>
+
+        {filter && (
+          <div className="flex items-center gap-3 mb-6">
+            <button
+              onClick={recheckPlagiarism}
+              disabled={rechecking}
+              className="btn-outline text-xs px-3 py-1.5 disabled:opacity-50"
+            >
+              {rechecking ? 'Re-checking...' : '↻ Re-check plagiarism for this exam'}
+            </button>
+            {recheckMsg && <p className="text-xs text-slate-500">{recheckMsg}</p>}
+          </div>
+        )}
 
         <div className="card">
           {loading ? (

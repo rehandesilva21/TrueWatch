@@ -1054,10 +1054,18 @@ def check_plagiarism():
     os.makedirs("data/uploads", exist_ok=True)
     file.save(fpath)
 
-    from modules.nlp.plagiarism_detector import PlagiarismDetector
+    from modules.nlp.plagiarism_detector import PlagiarismDetector, save_to_corpus
     detector = PlagiarismDetector()
     report   = detector.analyze(fpath, use_semantic=True)
     detector.save_report(report)
+
+    # Add this submission to the corpus AFTER analysis (never before — that
+    # would let a document match against itself). This is what makes
+    # cross-student comparison start working at all: right now nothing
+    # ever populates the corpus, so every single check reports 100%
+    # originality regardless of content. Each new submission becomes a
+    # comparison point for every submission after it.
+    save_to_corpus(fpath)
 
     ps = proctoring_sessions.get(session_token)
     if ps:
@@ -1134,6 +1142,82 @@ def list_corpus():
                 "size": os.path.getsize(fpath),
             })
     return jsonify({"files": files})
+
+
+@app.route('/api/exams/<int:exam_id>/plagiarism/recheck', methods=['POST'])
+def recheck_exam_plagiarism(exam_id):
+    """
+    Re-runs plagiarism analysis for every submission already checked in this
+    exam, cross-comparing them against each other (not just the standing
+    corpus) — catches copying between students that a check run at
+    submission time would miss if the other student hadn't submitted yet.
+    Synchronous: for typical class sizes this finishes in well under the
+    request timeout, but scales with (submissions × submissions) since each
+    one is compared against every other, so a very large cohort would be
+    slow. Not built for that scale here.
+    """
+    user, err = require_auth(roles=["lecturer", "admin"])
+    if err: return err
+
+    exam = db.session.get(Exam, exam_id)
+    if not exam:
+        return jsonify({"error": "Exam not found"}), 404
+
+    session_ids = [s.id for s in DBSession.query.filter_by(exam_id=exam_id).all()]
+    reports = PlagiarismReport.query.filter(
+        PlagiarismReport.session_id.in_(session_ids)).all() if session_ids else []
+
+    if not reports:
+        return jsonify({"status": "done", "updated": 0, "skipped": [],
+                         "message": "No submissions to recheck for this exam."})
+
+    from modules.nlp.plagiarism_detector import PlagiarismDetector
+    from modules.nlp.document_parser import read_document, clean_text
+
+    # One detector instance for the whole batch — loading the classifier
+    # and lazy-loading the semantic model once, not once per submission.
+    detector = PlagiarismDetector()
+
+    # Pre-read every submission once so the cross-comparison list is built
+    # from memory rather than re-reading the same files N times.
+    texts = {}
+    for r in reports:
+        if r.file_path and os.path.exists(r.file_path):
+            raw = read_document(r.file_path)
+            if raw:
+                texts[r.id] = (r.file_name, clean_text(raw))
+
+    updated, skipped = [], []
+    for r in reports:
+        if r.id not in texts:
+            skipped.append(r.file_name)
+            continue
+
+        peer_corpus = [texts[other_id] for other_id in texts if other_id != r.id]
+        own_corpus_name = os.path.basename(r.file_path) + ".txt"
+
+        report = detector.analyze(
+            r.file_path, use_semantic=True,
+            extra_corpus=peer_corpus, exclude_from_corpus=own_corpus_name,
+        )
+        if "error" in report:
+            skipped.append(r.file_name)
+            continue
+
+        r.originality_score = report.get("originality", r.originality_score)
+        r.risk_level         = RiskLevel(report.get("risk_level", "LOW"))
+        r.summary            = report.get("summary", r.summary)
+        r.tfidf_matches      = report.get("tfidf_matches",    [])
+        r.semantic_matches   = report.get("semantic_matches", [])
+        updated.append(r.file_name)
+
+    db.session.commit()
+
+    socketio.emit('plagiarism_recheck_complete', {
+        "exam_id": exam_id, "updated": len(updated), "skipped": len(skipped),
+    })
+
+    return jsonify({"status": "done", "updated": len(updated), "skipped": skipped})
 
 
 # ──────────────────────────────────────────────────────────────

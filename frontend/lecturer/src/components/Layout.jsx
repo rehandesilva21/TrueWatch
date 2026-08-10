@@ -37,6 +37,13 @@ const Icon = {
       <path d="M3 16.5h14" strokeLinecap="round"/>
     </svg>
   ),
+  corpus: (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6">
+      <path d="M4 4.5a1.5 1.5 0 0 1 1.5-1.5h6l4 4v9a1.5 1.5 0 0 1-1.5 1.5h-8.5A1.5 1.5 0 0 1 4 16Z" strokeLinejoin="round"/>
+      <path d="M11.5 3v3.5a1 1 0 0 0 1 1H16" strokeLinejoin="round"/>
+      <path d="M7 10.5h6M7 13.5h4" strokeLinecap="round"/>
+    </svg>
+  ),
   users: (
     <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6">
       <circle cx="7.2" cy="6.5" r="2.7"/>
@@ -65,6 +72,7 @@ const nav = [
   { to: '/sessions', label: 'Sessions',     icon: Icon.sessions  },
   { to: '/exams',    label: 'Exams',        icon: Icon.exams     },
   { to: '/results',  label: 'Results',      icon: Icon.results   },
+  { to: '/corpus',   label: 'Plag. corpus', icon: Icon.corpus    },
 ]
 
 const adminNav = [

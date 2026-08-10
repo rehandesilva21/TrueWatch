@@ -39,10 +39,16 @@ def save_to_corpus(file_path):
     fname = os.path.basename(file_path)
     text  = read_document(file_path)
     if text:
-        dest = os.path.join(CORPUS_PATH, fname)
+        # Store as .txt regardless of the source format — this file holds
+        # already-extracted plain text, not real PDF/DOCX bytes. Keeping
+        # the original extension (e.g. "essay.pdf") made load_corpus()
+        # hand it to read_pdf(), which tried to parse plain text as a PDF
+        # via PyMuPDF, failed silently, and contributed nothing to the
+        # corpus — every file added this way was a no-op.
+        dest = os.path.join(CORPUS_PATH, fname + ".txt")
         with open(dest, 'w', encoding='utf-8') as f:
             f.write(text)
-        print(f"Added to corpus: {fname}")
+        print(f"Added to corpus: {fname}.txt")
         return True
     return False
 
@@ -168,10 +174,26 @@ class PlagiarismDetector:
                 print(f"Could not load plagiarism classifier ({e}) — "
                       f"continuing with TF-IDF + semantic only.")
 
-    def analyze(self, file_path, use_semantic=True):
+    def analyze(self, file_path, use_semantic=True, extra_corpus=None, exclude_from_corpus=None):
         """
         Full plagiarism analysis pipeline.
         Returns a detailed report dict.
+
+        extra_corpus: optional list of (name, cleaned_text) tuples to compare
+        against in addition to the standing disk corpus, without writing them
+        to disk. Used by the exam-wide recheck endpoint to cross-compare
+        every submission in one exam against every other submission from
+        that same exam, including ones submitted after this one — the
+        standing corpus alone only ever contains documents added *before*
+        this one, so two students submitting close together would otherwise
+        never get compared against each other.
+
+        exclude_from_corpus: optional standing-corpus filename to exclude
+        before comparing. Every submission gets added to the standing corpus
+        right after its own original check (see check_plagiarism() in
+        api.py), so re-checking that same file later would otherwise find
+        its own copy sitting in the corpus and report a false ~100% match
+        against itself.
         """
         print(f"\nAnalyzing: {os.path.basename(file_path)}")
         print("─" * 50)
@@ -188,6 +210,10 @@ class PlagiarismDetector:
 
         # ── Load corpus ────────────────────────────────────
         corpus = load_corpus()
+        if exclude_from_corpus:
+            corpus = [(name, text) for name, text in corpus if name != exclude_from_corpus]
+        if extra_corpus:
+            corpus = corpus + list(extra_corpus)
         print(f"Corpus: {len(corpus)} reference documents")
 
         if not corpus:

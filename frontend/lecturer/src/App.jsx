@@ -8,6 +8,7 @@ import SessionDetail from './pages/SessionDetail'
 import CreateExam  from './pages/CreateExam'
 import ExamList    from './pages/ExamList'
 import Results     from './pages/Results'
+import PlagiarismCorpus from './pages/PlagiarismCorpus'
 import Users       from './pages/Users'
 import Batches     from './pages/Batches'
 
@@ -44,6 +45,7 @@ export default function App() {
       <Route path="/exams/create"   element={<PrivateRoute><CreateExam /></PrivateRoute>} />
       <Route path="/exams/:id/edit" element={<PrivateRoute><CreateExam /></PrivateRoute>} />
       <Route path="/results"        element={<PrivateRoute><Results /></PrivateRoute>} />
+      <Route path="/corpus"         element={<PrivateRoute><PlagiarismCorpus /></PrivateRoute>} />
       <Route path="/users"          element={<AdminRoute><Users /></AdminRoute>} />
       <Route path="/batches"        element={<AdminRoute><Batches /></AdminRoute>} />
       <Route path="*" element={<Navigate to="/" replace />} />
