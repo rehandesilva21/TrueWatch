@@ -20,7 +20,10 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python.vision import FaceLandmarker, FaceLandmarkerOptions, RunningMode
 
-MODEL_PATH = "models/face_landmarker.task"
+MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "models", "face_landmarker.task",
+)
 
 _landmarker = None
 

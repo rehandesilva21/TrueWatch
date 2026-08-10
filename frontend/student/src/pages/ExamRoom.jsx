@@ -148,11 +148,37 @@ export default function ExamRoom() {
         setIsDocumentExam(docOnly)
         isDocumentExamRef.current = docOnly
 
-        const calibRes = await API.get('/calibration').catch(() => ({ data: { profile: null } }))
-        const profile = calibRes.data.profile || DEFAULT_CALIBRATION
-        if (!calibRes.data.profile) {
-          console.warn('[ExamRoom] No saved calibration profile — using default thresholds')
+        // Identity verification is mandatory before an MCQ exam can start —
+        // ExamRoom polls /identity/verify throughout the exam, but that's
+        // meaningless if there's no reference photo to check against: the
+        // backend returns is_match: null (inconclusive) for the entire
+        // session and nothing ever actually gets verified. Document exams
+        // have no webcam monitoring at all, so this doesn't apply there.
+        if (!docOnly) {
+          const idRes = await API.get('/identity/status').catch(() => ({ data: { registered: false } }))
+          if (!idRes.data.registered) {
+            navigate('/register-face', { state: { redirectTo: `/exam/${examId}` } })
+            return
+          }
         }
+
+        const calibRes = await API.get('/calibration').catch(() => ({ data: { profile: null } }))
+
+        // Document exams have no webcam/behavioral monitoring at all (see
+        // CreateExam.jsx), so calibration is irrelevant there — only MCQ
+        // exams need it. For those, a missing profile isn't optional the
+        // way it silently was before: without it there's no way for a
+        // student to declare an eye condition, and gaze/head tolerances
+        // fall back to generic defaults that don't account for anyone.
+        // The desktop app runs this unconditionally before every session
+        // (run_eye_condition_check); the web app now matches that instead
+        // of quietly proceeding with one-size-fits-all thresholds.
+        if (!docOnly && !calibRes.data.profile) {
+          navigate('/calibration', { state: { redirectTo: `/exam/${examId}` } })
+          return
+        }
+
+        const profile = calibRes.data.profile || DEFAULT_CALIBRATION
         setCalibration(profile)
         calibrationRef.current = profile
 

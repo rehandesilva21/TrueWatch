@@ -1,5 +1,7 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import SidebarLayout from '../components/SidebarLayout'
+import API from '../api'
 
 function Toggle({ checked, onChange }) {
   return (
@@ -17,6 +19,14 @@ function Toggle({ checked, onChange }) {
 export default function Settings() {
   const [notifications, setNotifications] = useState(true)
   const [soundAlerts,   setSoundAlerts]   = useState(true)
+  const [identityRegistered, setIdentityRegistered] = useState(null) // null = checking
+  const navigate = useNavigate()
+
+  useEffect(() => {
+    API.get('/identity/status')
+      .then(res => setIdentityRegistered(res.data.registered))
+      .catch(() => setIdentityRegistered(null))
+  }, [])
 
   const rows = [
     { label: 'Exam notifications', desc: 'Get notified before your exams start', value: notifications, set: setNotifications },
@@ -27,6 +37,32 @@ export default function Settings() {
     <SidebarLayout>
       <div className="max-w-2xl mx-auto">
         <h1 className="text-[28px] font-semibold tracking-tight mb-7">Settings</h1>
+
+        <div className="glass-panel overflow-hidden mb-5">
+          <div className="px-5 py-4 flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium">Identity verification</p>
+              <p className="text-xs mt-0.5" style={{ color: 'var(--ink-soft)' }}>
+                {identityRegistered === null
+                  ? 'Checking...'
+                  : identityRegistered
+                    ? 'Your reference photo is on file — used to confirm it\u2019s you during exams.'
+                    : 'Not verified yet — required before you can start an exam.'}
+              </p>
+            </div>
+            {identityRegistered !== null && (
+              <button
+                onClick={() => navigate('/register-face')}
+                className={identityRegistered ? 'text-xs font-medium px-3 py-1.5 rounded-full' : 'text-xs font-semibold px-3 py-1.5 rounded-full'}
+                style={identityRegistered
+                  ? { background: 'rgba(0,0,0,0.06)', color: 'var(--ink-soft)' }
+                  : { background: '#B25000', color: 'white' }}
+              >
+                {identityRegistered ? 'Re-verify' : 'Verify now'}
+              </button>
+            )}
+          </div>
+        </div>
 
         <div className="glass-panel overflow-hidden">
           {rows.map((r, i) => (

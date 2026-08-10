@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useLocation } from 'react-router-dom'
 import API from '../api'
 
 export default function FaceRegistration() {
@@ -9,6 +9,11 @@ export default function FaceRegistration() {
   const canvasRef = useRef(null)
   const streamRef = useRef(null)
   const navigate  = useNavigate()
+  const location  = useLocation()
+  // Set when ExamRoom.jsx sent the student here because they had no
+  // registered face yet — chains through calibration (if also needed)
+  // straight back to the exam, instead of stopping at "done" here.
+  const redirectTo = location.state?.redirectTo || null
 
   useEffect(() => {
     API.get('/identity/status')
@@ -76,9 +81,9 @@ export default function FaceRegistration() {
 
       <div className="w-full max-w-md">
         <div className="text-center mb-6">
-          <h1 className="text-2xl font-semibold tracking-tight">Verify it\u2019s you</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">Verify it’s you</h1>
           <p className="text-sm mt-1.5" style={{ color: 'var(--ink-soft)' }}>
-            This photo confirms your identity before every exam. It\u2019s stored on our servers, never shared.
+            This photo confirms your identity before every exam. It’s stored on our servers, never shared.
           </p>
         </div>
 
@@ -97,9 +102,12 @@ export default function FaceRegistration() {
                   <path d="M20 6L9 17l-5-5" stroke="#34C759" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
                 </svg>
               </div>
-              <p className="font-medium">You\u2019re all set</p>
+              <p className="font-medium">You’re all set</p>
               <p className="text-sm mt-1 mb-6" style={{ color: 'var(--ink-soft)' }}>Your identity is registered.</p>
-              <button onClick={() => navigate('/calibration')} className="glass-btn-primary">
+              <button
+                onClick={() => navigate('/calibration', redirectTo ? { state: { redirectTo } } : undefined)}
+                className="glass-btn-primary"
+              >
                 Continue to calibration
               </button>
             </div>

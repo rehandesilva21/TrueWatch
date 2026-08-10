@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { useFaceMonitor } from '../hooks/useFaceMonitor'
 import API from '../api'
 
@@ -24,6 +24,11 @@ export default function Calibration() {
   const conditionRef  = useRef(null)
   const { load, detect } = useFaceMonitor()
   const navigate = useNavigate()
+  const location = useLocation()
+  // Set when ExamRoom.jsx redirects here because the student had no saved
+  // calibration profile yet — sends them back to the exam they were
+  // trying to start instead of dumping them on the dashboard.
+  const redirectTo = location.state?.redirectTo || null
 
   useEffect(() => () => {
     streamRef.current?.getTracks().forEach(t => t.stop())
@@ -213,8 +218,12 @@ export default function Calibration() {
                 </svg>
               </div>
               <p className="font-medium">Calibration complete</p>
-              <p className="text-sm mt-1 mb-6" style={{ color: 'var(--ink-soft)' }}>You're ready for your exam.</p>
-              <button onClick={() => navigate('/')} className="glass-btn-primary">Back to dashboard</button>
+              <p className="text-sm mt-1 mb-6" style={{ color: 'var(--ink-soft)' }}>
+                {redirectTo ? "You're ready — let's start your exam." : "You're ready for your exam."}
+              </p>
+              <button onClick={() => navigate(redirectTo || '/')} className="glass-btn-primary">
+                {redirectTo ? 'Continue to exam' : 'Back to dashboard'}
+              </button>
             </div>
           )}
         </div>

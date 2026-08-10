@@ -41,6 +41,7 @@ export default function Dashboard() {
   const [exams,    setExams]    = useState([])
   const [results,  setResults]  = useState([])
   const [loading,  setLoading]  = useState(true)
+  const [identityRegistered, setIdentityRegistered] = useState(null) // null = still checking
   const navigate = useNavigate()
   const location = useLocation()
   const [notice, setNotice] = useState(
@@ -50,6 +51,15 @@ export default function Dashboard() {
         ? { type: 'success', text: 'Your exam was submitted successfully.' }
         : null
   )
+
+  useEffect(() => {
+    // Soft nudge only — this never blocks anything here, it's just a
+    // reminder shown until they register. The actual enforcement (exam
+    // won't start without it) lives in ExamRoom.jsx.
+    API.get('/identity/status')
+      .then(res => setIdentityRegistered(res.data.registered))
+      .catch(() => setIdentityRegistered(null))
+  }, [])
 
   useEffect(() => {
     // Clear the router state so a page refresh doesn't re-show the banner
@@ -115,6 +125,18 @@ export default function Dashboard() {
               {notice.text}
             </p>
             <button onClick={() => setNotice(null)} className="text-xs hover:opacity-70 transition-opacity" style={{ color: 'var(--ink-soft)' }}>Dismiss</button>
+          </div>
+        )}
+        {identityRegistered === false && (
+          <div className="glass-panel p-4 mb-5 flex items-center justify-between" style={{ background: 'rgba(255,159,10,0.12)' }}>
+            <p className="text-sm font-medium flex items-center gap-2" style={{ color: '#B25000' }}>
+              <span>⚠</span>
+              Verify your identity before your first exam — takes about 30 seconds.
+            </p>
+            <button onClick={() => navigate('/register-face')} className="text-xs font-semibold px-3 py-1.5 rounded-full"
+                    style={{ background: '#B25000', color: 'white' }}>
+              Verify now
+            </button>
           </div>
         )}
         <div className="mb-7">

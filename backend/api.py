@@ -1532,20 +1532,36 @@ def verify_identity_snapshot():
 
     try:
         from deepface import DeepFace
-        # detector_backend="skip" + enforce_detection=False: we've already
-        # located and cropped the face with the landmarker, so DeepFace only
-        # has to run ArcFace's recognition embedding, not its own (weaker,
-        # Haar-cascade based) detection pass — this was the actual source
-        # of most "inconclusive" results before.
+        # detector_backend="opencv" (not "skip") + enforce_detection=True:
+        # "skip" was a mistake — it doesn't just skip *finding* the face,
+        # it also skips DeepFace's internal alignment step (leveling the
+        # eyes, standardizing the crop via facial landmarks), which ArcFace
+        # is highly sensitive to. Without it, embeddings for different
+        # people end up artificially close together, producing false
+        # "verified" matches — confirmed in testing: a different, clearly
+        # unregistered face was coming back as a match. Running OpenCV's
+        # detector on the already-cropped, face-filling MediaPipe crop
+        # (rather than the original full webcam frame) keeps this
+        # reliable — the original problem this was meant to fix — while
+        # keeping alignment intact. enforce_detection=True so a genuine
+        # detection failure raises instead of silently skipping alignment.
         result = DeepFace.verify(
             img1_path=face_crop, img2_path=ref_path,
-            model_name="ArcFace", detector_backend="skip",
-            distance_metric="cosine", enforce_detection=False,
+            model_name="ArcFace", detector_backend="opencv",
+            distance_metric="cosine", enforce_detection=True,
         )
         is_match   = result["verified"]
         distance   = result["distance"]
         confidence = max(0.0, 1.0 - (distance / 0.68))
         note = None
+    except ValueError as e:
+        # DeepFace raises ValueError specifically when its detector can't
+        # find a face in one of the two images — genuinely inconclusive,
+        # not "identity confirmed". A different, unregistered face is at
+        # least as likely to fail detection as the right one is.
+        is_match, distance, confidence = None, None, 0.0
+        note = "Face not clearly detected — check skipped"
+        print(f"[identity/verify] face not detected: {e}")
     except Exception as e:
         # Any other unexpected error (model load failure, corrupt image,
         # etc.) — also inconclusive, and logged loudly so it doesn't go
