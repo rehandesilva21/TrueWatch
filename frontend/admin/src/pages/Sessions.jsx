@@ -77,12 +77,12 @@ export default function Results() {
       <div className="max-w-5xl mx-auto px-8 py-10">
         <div className="flex items-center justify-between mb-6">
           <div>
-            <h1 className="text-[22px] font-semibold text-slate-900 tracking-tight">Results</h1>
+            <h1 className="text-[22px] font-semibold text-slate-900 tracking-tight">Sessions</h1>
             <p className="text-slate-500 mt-1">
-              {ungraded.length > 0
-                ? <span className="text-amber-600 font-medium">{ungraded.length} submission{ungraded.length !== 1 ? 's' : ''} awaiting grade</span>
-                : 'All submissions graded'
-              }
+              Every proctoring session across every lecturer's exams.
+              {ungraded.length > 0 && (
+                <span className="text-amber-600 font-medium"> {ungraded.length} awaiting grade.</span>
+              )}
             </p>
           </div>
           <select className="input w-auto" value={filter} onChange={e => setFilter(e.target.value)}>

@@ -2,6 +2,8 @@ import { Routes, Route, Navigate } from 'react-router-dom'
 import { useAuth } from './context/AuthContext'
 import Login    from './pages/Login'
 import Dashboard from './pages/Dashboard'
+import Sessions  from './pages/Sessions'
+import SessionDetail from './pages/SessionDetail'
 import Users    from './pages/Users'
 import Batches  from './pages/Batches'
 
@@ -18,10 +20,12 @@ function PrivateRoute({ children }) {
 export default function App() {
   return (
     <Routes>
-      <Route path="/login"   element={<Login />} />
-      <Route path="/"        element={<PrivateRoute><Dashboard /></PrivateRoute>} />
-      <Route path="/users"   element={<PrivateRoute><Users /></PrivateRoute>} />
-      <Route path="/batches" element={<PrivateRoute><Batches /></PrivateRoute>} />
+      <Route path="/login"        element={<Login />} />
+      <Route path="/"             element={<PrivateRoute><Dashboard /></PrivateRoute>} />
+      <Route path="/sessions"     element={<PrivateRoute><Sessions /></PrivateRoute>} />
+      <Route path="/sessions/:id" element={<PrivateRoute><SessionDetail /></PrivateRoute>} />
+      <Route path="/users"        element={<PrivateRoute><Users /></PrivateRoute>} />
+      <Route path="/batches"      element={<PrivateRoute><Batches /></PrivateRoute>} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )
