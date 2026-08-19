@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { useFaceMonitor }  from '../hooks/useFaceMonitor'
 import { useAudioMonitor } from '../hooks/useAudioMonitor'
+import { useFusionModel }  from '../hooks/useFusionModel'
 import API from '../api'
 
 const ALERT_FRAMES = 20
@@ -21,6 +22,7 @@ const SCORE_PENALTY = {
   IDENTITY_MISMATCH: 8,
   PROHIBITED_OBJECT: 6,
   MULTI_FACE:         5,
+  FUSION_HIGH_RISK:   5,
   TAB_SWITCH:          4,
   ABSENT:              3,
   AUDIO_LOUD:          2,
@@ -37,6 +39,7 @@ const OBJECT_CHECK_INTERVAL_MS   = 3000
 const RULE_SCORE_PUSH_INTERVAL_MS = 15000
 const AUDIO_CLIP_INTERVAL_MS = 8000
 const PERIODIC_REQUEST_TIMEOUT_MS = 12000
+const TAB_SWITCH_RECENT_WINDOW_MS = 5000
 
 const scoreColor = (score) => score >= 90 ? '#027A48' : score >= 70 ? '#B54708' : '#B42318'
 const scoreBadgeClass = (score) => score >= 90 ? 'exam-badge-success' : score >= 70 ? 'exam-badge-warning' : 'exam-badge-danger'
@@ -102,14 +105,34 @@ export default function ExamRoom() {
   const isDocumentExamRef = useRef(false)
   const warningIdRef = useRef(0)
   const inFlightRef = useRef({ object: false, identity: false, audioClip: false })
+  const lastObjectDetectedRef = useRef(false)
+  const lastTabSwitchAtRef    = useRef(0)
+  // Mirrors the fusion model's `ready` state into a ref, following the
+  // exact same pattern already used for faceReadyRef above. tick() is
+  // created once and re-schedules itself via requestAnimationFrame
+  // forever — it never gets recreated on a new render — so any plain
+  // React state it closes over (like `fusionReady`) stays frozen at
+  // whatever value existed on the render that created it, which is
+  // `false`, since loadFusion() hasn't resolved yet at that point. That
+  // stale closure was the actual reason zero fusion_score requests were
+  // ever firing, even though the model itself loaded correctly:
+  // runFusionInference's `if (!fusionReady) return` was permanently
+  // seeing the frozen initial value. Reading fusionReadyRef.current
+  // instead gives tick() a live value on every call.
+  const fusionReadyRef = useRef(false)
 
   const { load: loadFace, detect: detectFace } = useFaceMonitor()
   const {
     start: startAudio, stop: stopAudio, calibrateBackground,
     classify: classifyAudio, recordClip,
   } = useAudioMonitor()
+  const {
+    load: loadFusion, ready: fusionReady,
+    buildFeatureVector, pushFrame, predict: predictFusion,
+  } = useFusionModel()
 
   useEffect(() => { answersRef.current = answers }, [answers])
+  useEffect(() => { fusionReadyRef.current = fusionReady }, [fusionReady])
 
   const pushWarning = (type, details) => {
     warningIdRef.current += 1
@@ -211,6 +234,7 @@ export default function ExamRoom() {
     const handleTabAway = (reason) => {
       if (isDocumentExamRef.current) return
       counters.current.tabSwitches += 1
+      lastTabSwitchAtRef.current = performance.now()
       logIncident('TAB_SWITCH', 0.99, `Switched away from exam (${reason})`)
     }
     const handleVisibility = () => { if (document.hidden) handleTabAway('tab hidden') }
@@ -263,17 +287,65 @@ export default function ExamRoom() {
       errors.push('Microphone unavailable — audio detection disabled.')
     }
 
+    try {
+      await loadFusion()
+    } catch (err) {
+      console.error('[ExamRoom] Fusion model load error:', err.message)
+    }
+
     if (errors.length) setMonitorError(errors.join(' '))
     detectionLoop()
+  }
+
+  const runFusionInference = (gazeDev, headDev, lipDev, faceCount, audio) => {
+    if (!fusionReadyRef.current) return   // FIX: was `if (!fusionReady) return` — stale closure
+
+    const tabSwitchRecent = (performance.now() - lastTabSwitchAtRef.current) < TAB_SWITCH_RECENT_WINDOW_MS
+
+    const features = buildFeatureVector({
+      gazeDev, headDev, lipDev, faceCount,
+      audioClass: audio.class, audioAlert: audio.alert,
+      identityMismatch: identityStatus === 'mismatch',
+      objectInUse: lastObjectDetectedRef.current,
+      tabSwitchRecent,
+    })
+
+    const windowFull = pushFrame(features)
+    if (!windowFull) return
+
+    const fusionScore = predictFusion()
+    if (fusionScore === null) return
+
+    const now = performance.now()
+    if (now - lastSnapshotAt.current.fusion > RULE_SCORE_PUSH_INTERVAL_MS) {
+      lastSnapshotAt.current.fusion = now
+
+      API.post('/session/fusion_score', {
+        session_token: sessionTokenRef.current,
+        score: fusionScore,
+        feature_vector: features,
+      }, { timeout: PERIODIC_REQUEST_TIMEOUT_MS }).catch(err =>
+        console.error('[ExamRoom] Failed to push fusion score:', err?.message || err)
+      )
+
+      if (fusionScore > 0.7) {
+        logIncident('FUSION_HIGH_RISK', fusionScore, 'Sustained multi-signal anomaly pattern (trained LSTM)')
+      }
+    }
   }
 
   const detectionLoop = () => {
     const tick = () => {
       try {
+        let gazeDevFlag = false, headDevFlag = false, lipDevFlag = false
+        let faceCountThisTick = 1
+
         if (faceReadyRef.current) {
           const result = detectFace(videoRef.current, performance.now())
 
           if (result) {
+            faceCountThisTick = result.faceCount
+
             if (result.faceCount === 0) {
               counters.current.absent += 1
               if (counters.current.absent === ALERT_FRAMES) logIncident('ABSENT', 0.99, 'No face detected')
@@ -287,13 +359,13 @@ export default function ExamRoom() {
 
             const calib = calibrationRef.current
             if (result.faceCount === 1 && calib) {
-              const gazeDev = Math.abs(result.gaze - calib.gaze_baseline) > calib.gaze_tolerance
-              const headDev = Math.abs(result.head - calib.head_baseline) > calib.head_tolerance
-              const lipDev  = Math.abs(result.lip  - calib.lip_baseline)  > 0.04
+              gazeDevFlag = Math.abs(result.gaze - calib.gaze_baseline) > calib.gaze_tolerance
+              headDevFlag = Math.abs(result.head - calib.head_baseline) > calib.head_tolerance
+              lipDevFlag  = Math.abs(result.lip  - calib.lip_baseline)  > 0.04
 
-              counters.current.gaze = gazeDev ? counters.current.gaze + 1 : 0
-              counters.current.head = headDev ? counters.current.head + 1 : 0
-              counters.current.lip  = lipDev  ? counters.current.lip  + 1 : 0
+              counters.current.gaze = gazeDevFlag ? counters.current.gaze + 1 : 0
+              counters.current.head = headDevFlag ? counters.current.head + 1 : 0
+              counters.current.lip  = lipDevFlag  ? counters.current.lip  + 1 : 0
 
               if (counters.current.gaze === ALERT_FRAMES) logIncident('GAZE', 0.85, 'Looking away from screen')
               if (counters.current.head === ALERT_FRAMES) logIncident('HEAD', 0.85, 'Head turned away')
@@ -302,18 +374,13 @@ export default function ExamRoom() {
           }
         }
 
-        // Continuous rule-based classifier — drives the live audio badge
-        // and catches whisper/speech/loud, which the periodic trained
-        // ensemble (every 8s) could otherwise miss for a short burst.
-        // FIX: 'loud' previously had no incident trigger at all here —
-        // only the rule-based badge updated, so a loud-talking event
-        // never actually got logged unless the 8-second server-side
-        // audio-clip check happened to land during it.
         const audio = classifyAudio()
         setAudioClass(audio.class)
         if (audio.alert && audio.class === 'loud')    logIncident('AUDIO_LOUD', 0.8, 'Loud voice detected')
         if (audio.alert && audio.class === 'whisper') logIncident('AUDIO_WHISPER', 0.75, 'Whisper detected')
         if (audio.alert && audio.class === 'speech')  logIncident('AUDIO_SPEECH', 0.7, 'Voice detected')
+
+        runFusionInference(gazeDevFlag, headDevFlag, lipDevFlag, faceCountThisTick, audio)
 
         const now = performance.now()
         if (now - lastSnapshotAt.current.object > OBJECT_CHECK_INTERVAL_MS) {
@@ -324,10 +391,6 @@ export default function ExamRoom() {
           lastSnapshotAt.current.identity = now
           setIdentityStatus(prev => prev === 'verified' ? prev : 'verifying')
           postSnapshot('/identity/verify', 'identity')
-        }
-        if (now - lastSnapshotAt.current.fusion > RULE_SCORE_PUSH_INTERVAL_MS) {
-          lastSnapshotAt.current.fusion = now
-          pushRuleScore()
         }
         if (now - lastSnapshotAt.current.audioClip > AUDIO_CLIP_INTERVAL_MS) {
           lastSnapshotAt.current.audioClip = now
@@ -340,19 +403,6 @@ export default function ExamRoom() {
       }
     }
     rafRef.current = requestAnimationFrame(tick)
-  }
-
-  const pushRuleScore = async () => {
-    if (!sessionTokenRef.current) return
-    try {
-      await API.post('/session/fusion_score', {
-        session_token: sessionTokenRef.current,
-        score: +(1 - scoreRef.current / 100).toFixed(4),
-        feature_vector: null,
-      }, { timeout: PERIODIC_REQUEST_TIMEOUT_MS })
-    } catch (err) {
-      console.error('[ExamRoom] Failed to push rule score:', err?.message || err)
-    }
   }
 
   const postAudioClip = async () => {
@@ -397,8 +447,11 @@ export default function ExamRoom() {
           setIdentityStatus(prev => prev === 'verifying' ? 'pending' : prev)
         }
       }
-      if (endpoint === '/object/detect' && res.data.detections?.length) {
-        res.data.detections.forEach(d => logIncident('PROHIBITED_OBJECT', d.confidence, `${d.class} detected`))
+      if (endpoint === '/object/detect') {
+        lastObjectDetectedRef.current = (res.data.detections?.length ?? 0) > 0
+        if (res.data.detections?.length) {
+          res.data.detections.forEach(d => logIncident('PROHIBITED_OBJECT', d.confidence, `${d.class} detected`))
+        }
       }
     } catch (err) {
       console.error(`[ExamRoom] ${endpoint} failed:`, err?.response?.data || err?.message || err)
@@ -514,7 +567,7 @@ export default function ExamRoom() {
               <div className="exam-card-header flex items-center justify-between">
                 <span>Proctoring</span>
                 <span className="normal-case font-normal text-gray-400">
-                  {incidentCount} logged
+                  {incidentCount} logged{fusionReady ? ' · LSTM active' : ''}
                 </span>
               </div>
               <div className="p-3">
