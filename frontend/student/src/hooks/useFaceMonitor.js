@@ -1,6 +1,7 @@
 import { useRef, useState, useCallback } from 'react'
 import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision'
 
+// Landmark indices — identical math to the Python pipeline
 const LEFT_IRIS = 473, LEFT_EYE_L = 263, LEFT_EYE_R = 362
 const NOSE_TIP = 1, LEFT_EAR = 234, RIGHT_EAR = 454
 const UPPER_LIP = 13, LOWER_LIP = 14, LIP_L = 61, LIP_R = 291
@@ -29,21 +30,28 @@ function lipDistance(landmarks) {
 
 export function useFaceMonitor() {
   const landmarkerRef = useRef(null)
+  // Tracks the last timestamp actually passed to detectForVideo(). MediaPipe's
+  // VIDEO running mode requires every call's timestamp to be strictly greater
+  // than the previous one — performance.now() can occasionally violate this
+  // across animation-frame ticks (tab backgrounding/foregrounding, React
+  // StrictMode double-invoke, etc.), which throws inside MediaPipe's WASM
+  // internals. That throw previously propagated all the way up through
+  // ExamRoom's tick() and silently killed the ENTIRE detection loop —
+  // gaze, head, absence, identity and object checks all stopped at once,
+  // since they all live inside that same loop.
+  const lastTimestampRef = useRef(-1)
   const [ready, setReady] = useState(false)
 
   const load = useCallback(async () => {
     if (landmarkerRef.current) return
     try {
-      console.log('[FaceMonitor] Resolving WASM fileset...')
       const filesetResolver = await FilesetResolver.forVisionTasks(
         'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
       )
-      console.log('[FaceMonitor] WASM fileset resolved, creating landmarker...')
-
       landmarkerRef.current = await FaceLandmarker.createFromOptions(filesetResolver, {
         baseOptions: {
           modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-          delegate: 'CPU',
+          delegate: 'CPU',   // GPU delegate fails on many Windows setups
         },
         runningMode: 'VIDEO',
         numFaces: 2,
@@ -51,41 +59,47 @@ export function useFaceMonitor() {
       setReady(true)
       console.log('[FaceMonitor] Loaded successfully')
     } catch (err) {
-      // Common causes if this throws:
-      // - CORS/network block on cdn.jsdelivr.net or storage.googleapis.com
-      //   (check browser Network tab for blocked/failed requests)
-      // - Content-Security-Policy in your app blocking those origins
-      // - Browser/WebAssembly not supported in this environment
       console.error('[FaceMonitor] Failed to load:', err.name, err.message)
-      setReady(false)
       throw err
     }
   }, [])
 
+  // Call once per animation frame with a <video> element
   const detect = useCallback((videoEl, timestampMs) => {
-    if (!landmarkerRef.current) {
-      // Model not loaded yet — nothing to detect
+    if (!landmarkerRef.current || !videoEl || videoEl.readyState < 2) return null
+
+    // Enforce a strictly-increasing integer timestamp. If the incoming
+    // value hasn't advanced (or went backwards), bump it by 1ms rather
+    // than passing it through unchanged — this is what MediaPipe actually
+    // requires, and doing it here means every caller gets this protection
+    // automatically instead of needing to reimplement it.
+    let ts = Math.floor(timestampMs)
+    if (ts <= lastTimestampRef.current) {
+      ts = lastTimestampRef.current + 1
+    }
+    lastTimestampRef.current = ts
+
+    try {
+      const result = landmarkerRef.current.detectForVideo(videoEl, ts)
+      const faceCount = result.faceLandmarks?.length || 0
+      if (faceCount === 0) {
+        return { faceCount: 0, gaze: null, head: null, lip: null, landmarks: null }
+      }
+      const lm = result.faceLandmarks[0]
+      return {
+        faceCount,
+        gaze: gazeRatio(lm),
+        head: headPose(lm),
+        lip: lipDistance(lm),
+        landmarks: lm,
+      }
+    } catch (err) {
+      // A single bad frame must never propagate and kill the caller's
+      // detection loop — log it once, loudly, and return null so the
+      // caller treats this exactly like "no face detected this frame"
+      // and simply tries again next tick.
+      console.error('[FaceMonitor] detectForVideo failed on this frame:', err.message)
       return null
-    }
-    if (!videoEl || videoEl.readyState < 2) {
-      // Video not producing frames yet (readyState < HAVE_CURRENT_DATA)
-      return null
-    }
-
-    const result = landmarkerRef.current.detectForVideo(videoEl, timestampMs)
-    const faceCount = result.faceLandmarks?.length || 0
-
-    if (faceCount === 0) {
-      return { faceCount: 0, gaze: null, head: null, lip: null, landmarks: null }
-    }
-
-    const lm = result.faceLandmarks[0]
-    return {
-      faceCount,
-      gaze: gazeRatio(lm),
-      head: headPose(lm),
-      lip: lipDistance(lm),
-      landmarks: lm,
     }
   }, [])
 

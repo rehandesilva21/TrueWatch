@@ -18,6 +18,7 @@ import os
 import pickle
 import numpy as np
 from tensorflow.keras.models import load_model
+from modules.audio.cnn_model import load_audio_cnn
 
 from modules.audio.esc50_loader import (
     load_audio_fixed,
@@ -38,11 +39,9 @@ _best_w = None
 
 
 def load_ensemble(model_dir=MODEL_DIR):
-    """Loads all 5 artifacts once and caches them at module level. Call this
-    at app startup (not per-request) since load_model() is not cheap."""
     global _cnn, _lgbm, _scaler, _label_encoder, _best_w
 
-    _cnn = load_model(os.path.join(model_dir, "audio_cnn.keras"))
+    _cnn = load_audio_cnn()   # CHANGED from: load_model(os.path.join(model_dir, "audio_cnn.keras"))
     with open(os.path.join(model_dir, "audio_lgbm.pkl"), "rb") as f:
         _lgbm = pickle.load(f)
     with open(os.path.join(model_dir, "audio_scaler.pkl"), "rb") as f:
@@ -56,8 +55,6 @@ def load_ensemble(model_dir=MODEL_DIR):
             _best_w = float(f.read().strip())
     else:
         _best_w = 0.5
-        print(f"WARNING: {weight_path} not found — defaulting ensemble weight to 0.5. "
-              f"Download it from your Drive TrueWatch_models folder for the tuned value.")
 
     print(f"Audio ensemble loaded from {model_dir} (CNN weight = {_best_w:.2f})")
 

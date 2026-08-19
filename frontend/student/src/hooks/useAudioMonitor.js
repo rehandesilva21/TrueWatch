@@ -1,11 +1,16 @@
 import { useRef, useState, useCallback } from 'react'
 
 export function useAudioMonitor() {
-  const audioCtxRef  = useRef(null)
-  const analyserRef  = useRef(null)
-  const dataRef      = useRef(null)
-  const streamRef    = useRef(null)
-  const bgEnergyRef  = useRef(0.003)
+  const audioCtxRef     = useRef(null)
+  const analyserRef     = useRef(null)
+  const dataRef         = useRef(null)
+  const streamRef       = useRef(null)
+  const bgEnergyRef     = useRef(0.003)
+  const workletNodeRef  = useRef(null)
+  const workletReadyRef = useRef(false)
+  const historyRef  = useRef([])
+  const HISTORY_SIZE = 8   // ~8 frames of smoothing ≈ 130ms window at 60fps
+
   const [ready, setReady] = useState(false)
 
   const start = useCallback(async () => {
@@ -14,12 +19,6 @@ export function useAudioMonitor() {
 
     const ctx = new (window.AudioContext || window.webkitAudioContext)()
 
-    // Browsers can create AudioContexts in a 'suspended' state due to
-    // autoplay/gesture policies, especially when created inside an async
-    // init chain rather than directly from a click handler. If it's
-    // suspended, getByteFrequencyData returns near-zero data, which makes
-    // background calibration bake in a near-zero baseline and every later
-    // sound looks artificially "loud". Explicitly resume to guard against this.
     if (ctx.state === 'suspended') {
       try {
         await ctx.resume()
@@ -36,15 +35,21 @@ export function useAudioMonitor() {
     audioCtxRef.current = ctx
     analyserRef.current = analyser
     dataRef.current = new Uint8Array(analyser.frequencyBinCount)
+    historyRef.current = []
+
+    try {
+      await ctx.audioWorklet.addModule('/recorder-worklet.js')
+      workletReadyRef.current = true
+    } catch (err) {
+      console.error('[AudioMonitor] Failed to load recorder worklet:', err.message)
+      workletReadyRef.current = false
+    }
+
     setReady(true)
     console.log('[AudioMonitor] Started, context state:', ctx.state)
     return stream
   }, [])
 
-  // Reads frequency data ONCE and returns both the raw byte array and the
-  // computed RMS energy, so every caller in a given tick works off the same
-  // sample instead of re-sampling (and potentially getting a slightly
-  // different frame) on every read.
   const readFrame = () => {
     if (!analyserRef.current || !dataRef.current) return { data: null, energy: 0 }
     analyserRef.current.getByteFrequencyData(dataRef.current)
@@ -54,7 +59,6 @@ export function useAudioMonitor() {
     return { data, energy }
   }
 
-  // Kept for external callers that only want energy (e.g. simple VU meters).
   const getEnergy = () => readFrame().energy
 
   const calibrateBackground = useCallback((durationMs = 3000) => {
@@ -89,32 +93,96 @@ export function useAudioMonitor() {
     const air     = bin(6000, 11000)
     const bg      = bgEnergyRef.current
 
-    if (energy < bg * 1.2) return { class: 'silence', energy, alert: false }
-    if (energy > bg * 20)  return { class: 'loud', energy, alert: true }
+    historyRef.current.push({ energy, lowMid, highMid, air })
+    if (historyRef.current.length > HISTORY_SIZE) historyRef.current.shift()
 
-    // Guard: whisperScore divides by lowMid, which can be near-zero even
-    // during ordinary faint noise (fan hum, chair creak). Require a minimum
-    // absolute high-frequency energy before trusting the ratio, otherwise
-    // tiny numerator noise over a near-zero denominator produces a huge,
-    // meaningless ratio that used to false-trigger "whisper".
-    const whisperScore = (highMid + air) / Math.max(lowMid, 0.02)
-    if (energy > bg * 2.5 && energy < bg * 6 && (highMid + air) > 0.03 && whisperScore > 1.2) {
-      return { class: 'whisper', energy, alert: true }
+    const avg = (key) => historyRef.current.reduce((s, r) => s + r[key], 0) / historyRef.current.length
+    const avgEnergy  = avg('energy')
+    const avgLowMid  = avg('lowMid')
+    const avgHighMid = avg('highMid')
+    const avgAir     = avg('air')
+
+    if (avgEnergy < bg * 1.2) return { class: 'silence', energy: avgEnergy, alert: false }
+
+    // FIX: bg*20 required near-shouting volume — realistic loud talking
+    // almost never reached it, so it silently fell through to the
+    // 'speech' branch below instead of ever being classified as 'loud'.
+    // bg*9 still sits clearly above normal conversational speech
+    // (bg*3.5–bg*9 covers loud-but-normal talking) while being
+    // reachable without shouting directly into the mic.
+    if (avgEnergy > bg * 9) return { class: 'loud', energy: avgEnergy, alert: true }
+
+    if (avgEnergy > bg * 3.5 && avgLowMid > avgHighMid * 1.15) {
+      return { class: 'speech', energy: avgEnergy, alert: true }
     }
-    if (energy > bg * 6 && lowMid > highMid) {
-      return { class: 'speech', energy, alert: true }
+
+    const whisperScore = (avgHighMid + avgAir) / Math.max(avgLowMid, 0.02)
+    if (avgEnergy > bg * 1.8 && avgEnergy <= bg * 3.5 && (avgHighMid + avgAir) > 0.03 && whisperScore > 1.3) {
+      return { class: 'whisper', energy: avgEnergy, alert: true }
     }
-    return { class: 'ambient', energy, alert: false }
+
+    return { class: 'ambient', energy: avgEnergy, alert: false }
+  }, [])
+
+  const recordClip = useCallback((durationMs = 2000) => {
+    return new Promise((resolve, reject) => {
+      const ctx = audioCtxRef.current
+      const stream = streamRef.current
+      if (!ctx || !stream) return reject(new Error('Audio not started — call start() first'))
+      if (!workletReadyRef.current) return reject(new Error('Recorder worklet not loaded'))
+
+      const source = ctx.createMediaStreamSource(stream)
+      const node = new AudioWorkletNode(ctx, 'recorder-worklet')
+      workletNodeRef.current = node
+
+      node.port.onmessage = (e) => {
+        const merged = e.data
+        source.disconnect()
+        node.disconnect()
+        resolve(encodeWAV(merged, ctx.sampleRate))
+      }
+
+      source.connect(node)
+
+      node.port.postMessage('start')
+      setTimeout(() => {
+        node.port.postMessage('stop')
+      }, durationMs)
+    })
   }, [])
 
   const stop = useCallback(() => {
     streamRef.current?.getTracks().forEach(t => t.stop())
     streamRef.current = null
+    workletNodeRef.current?.disconnect()
+    workletNodeRef.current = null
     audioCtxRef.current?.close()
     audioCtxRef.current = null
     analyserRef.current = null
+    historyRef.current = []
     setReady(false)
   }, [])
 
-  return { start, stop, calibrateBackground, classify, getEnergy, ready }
+  return { start, stop, calibrateBackground, classify, recordClip, getEnergy, ready }
+}
+
+function encodeWAV(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2)
+  const view = new DataView(buffer)
+  const writeStr = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)) }
+
+  writeStr(0, 'RIFF'); view.setUint32(4, 36 + samples.length * 2, true)
+  writeStr(8, 'WAVE'); writeStr(12, 'fmt ')
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true)
+  view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true)
+  view.setUint16(34, 16, true); writeStr(36, 'data')
+  view.setUint32(40, samples.length * 2, true)
+
+  let offset = 44
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]))
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true)
+  }
+  return new Blob([view], { type: 'audio/wav' })
 }

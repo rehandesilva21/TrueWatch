@@ -1,5 +1,13 @@
-import sys
 import os
+# MUST be the very first thing that runs, before any other import — this
+# environment variable only takes effect if set before a native library
+# reads it during its own initialization. Prevents an OpenMP-runtime
+# conflict between TensorFlow (audio CNN) and LightGBM in this same
+# process from aborting with a segmentation fault.
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
 
@@ -33,7 +41,7 @@ app.config['SECRET_KEY'] = 'truewatch-secret-key-2024'
 CORS(app, origins="*")
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# ─── Database init ─────────────────────────────────────────────
+# ─── Database + model imports ──────────────────────────────────
 from backend.database import db, init_db
 from backend.models import (
     User, Exam, ExamEnrollment, Session as DBSession,
@@ -42,16 +50,60 @@ from backend.models import (
     IdentityCheck, ObjectDetectionEvent, FusionScore,
     UserRole, ExamStatus, ExamType, AssignmentType, SessionResult, RiskLevel
 )
-init_db(app)
+from modules.audio.audio_inference import load_ensemble, predict_from_file, predict_from_array
+import numpy as np
+
+
+def bootstrap():
+    """
+    All heavyweight, side-effecting startup work — DB connection, audio
+    ensemble load+warmup, YOLO worker process start+warmup — lives here
+    instead of at bare module level. macOS's 'spawn' multiprocessing
+    start method re-imports this entire file fresh inside the child
+    process to reconstruct its namespace; if this initialization ran
+    unconditionally at module level, the child would re-run it too —
+    which is exactly what caused duplicated "Database connected..." log
+    lines and a "attempt to start a new process before bootstrapping
+    finished" error the first time the YOLO worker process was added.
+    Calling this only from inside `if __name__ == "__main__":` means the
+    child's re-import sees __name__ as '__mp_main__', not '__main__', so
+    it skips this function entirely instead of re-triggering it.
+    """
+    init_db(app)
+
+    try:
+        load_ensemble()
+
+        _dummy_audio = np.zeros(int(22050 * 5), dtype=np.float32)  # 5s silence
+        predict_from_array(_dummy_audio)
+        print("Audio model warmed up.")
+    except Exception as e:
+        print(f"WARNING: Could not load audio ensemble models: {e}")
+        print("Audio clip classification will be unavailable until models/audio/*.* files are present.")
+
+    try:
+        from modules.vision.yolo_worker import YoloWorkerHandle
+        print("Starting isolated YOLO worker process...")
+        app._yolo_worker = YoloWorkerHandle()
+        _dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        app._yolo_worker.detect(_dummy_frame, timeout=30.0)
+        print("YOLO worker warmed up and ready.")
+    except Exception as e:
+        print(f"WARNING: Could not start YOLO worker process: {e}")
+        print("Object detection will be unavailable.")
+
 
 # ─── Global proctoring state ───────────────────────────────────
-proctoring_sessions = {}  # token → { logger, tab_monitor, db_session_id }
-_token_store        = {}  # token → User object
+proctoring_sessions = {}
+_token_store        = {}
 
+# ─── Native-model concurrency locks ─────────────────────────────
+_object_detector_lock = threading.Lock()
+_yolo_lock             = threading.Lock()
+_arcface_lock          = threading.Lock()
+_audio_lock            = threading.Lock()
+_plagiarism_lock       = threading.Lock()
 
-# ──────────────────────────────────────────────────────────────
-# HELPERS
-# ──────────────────────────────────────────────────────────────
 
 def require_auth(roles=None):
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
@@ -63,18 +115,10 @@ def require_auth(roles=None):
     return user, None
 
 
-# ──────────────────────────────────────────────────────────────
-# HEALTH
-# ──────────────────────────────────────────────────────────────
-
 @app.route('/api/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok", "service": "TrueWatch API v2.1"})
 
-
-# ──────────────────────────────────────────────────────────────
-# AUTH
-# ──────────────────────────────────────────────────────────────
 
 @app.route('/api/auth/login', methods=['POST'])
 def login():
@@ -111,16 +155,8 @@ def me():
 
 @app.route('/api/auth/register', methods=['POST'])
 def register():
-    # Public self-registration is disabled: students don't create their own
-    # accounts, an admin creates them (with a batch assignment) via
-    # POST /api/admin/users. This endpoint is kept only to return a clear
-    # error instead of a 404 for any old client still pointing at it.
     return jsonify({"error": "Self-registration is disabled. Ask your administrator to create your account."}), 403
 
-
-# ──────────────────────────────────────────────────────────────
-# ADMIN
-# ──────────────────────────────────────────────────────────────
 
 @app.route('/api/admin/users', methods=['GET'])
 def admin_get_users():
@@ -207,14 +243,6 @@ def admin_stats():
     })
 
 
-# ──────────────────────────────────────────────────────────────
-# BATCHES
-# ──────────────────────────────────────────────────────────────
-# A batch is a class/cohort of students. Admins create batches and assign
-# students to them (students don't self-register, so this is the only way
-# a student ends up in a batch). Lecturers read batches to target a whole
-# cohort with one exam instead of enrolling students one at a time.
-
 @app.route('/api/batches', methods=['GET'])
 def list_batches():
     user, err = require_auth(roles=["admin", "lecturer"])
@@ -264,9 +292,6 @@ def delete_batch(batch_id):
     if not batch:
         return jsonify({"error": "Batch not found"}), 404
 
-    # Unassign students rather than leaving dangling batch_id references,
-    # and detach any exams that were pointed at this batch (they fall back
-    # to individual assignment rather than silently losing their enrollees).
     for student in batch.students:
         student.batch_id = None
     for exam in Exam.query.filter_by(batch_id=batch_id).all():
@@ -290,20 +315,7 @@ def batch_students(batch_id):
     return jsonify({"students": [s.to_dict() for s in batch.students]})
 
 
-# ──────────────────────────────────────────────────────────────
-# EXAMS
-# ──────────────────────────────────────────────────────────────
-
 def sync_batch_enrollment(exam):
-    """
-    Make sure every student currently in exam.batch_id has an
-    ExamEnrollment row for this exam. Called whenever an exam is created
-    or edited with assignment_type='batch', and also exposed as its own
-    endpoint so a lecturer can re-sync if students are added to the batch
-    after the exam was already created. Never removes an enrollment (a
-    student who already started/finished the exam keeps their record even
-    if they're later moved out of the batch).
-    """
     if exam.assignment_type != AssignmentType.BATCH or not exam.batch_id:
         return 0
     students = User.query.filter_by(batch_id=exam.batch_id, role=UserRole.STUDENT).all()
@@ -316,8 +328,6 @@ def sync_batch_enrollment(exam):
     if added:
         db.session.commit()
     return added
-
-
 @app.route('/api/exams', methods=['GET'])
 def get_exams():
     user, err = require_auth()
@@ -427,10 +437,6 @@ def update_exam(exam_id):
     if "description"   in data: exam.description   = data["description"]
     if "duration_mins" in data: exam.duration_mins = data["duration_mins"]
     if "status"        in data: exam.status        = ExamStatus(data["status"])
-    # Empty-string values are legitimate here — the edit form always sends
-    # the full object back, including unset date fields as "". A key being
-    # *present* doesn't mean it has a real value; treat empty as "clear the
-    # date" (None) instead of handing '' to fromisoformat(), which raises.
     if "start_time" in data:
         exam.start_time = datetime.fromisoformat(data["start_time"]) if data["start_time"] else None
     if "end_time" in data:
@@ -499,10 +505,6 @@ def get_exam_students(exam_id):
     students    = []
     for e in enrollments:
         s    = db.session.get(User, e.student_id)
-        # A student should only ever have one Session per exam now that
-        # start_session blocks re-attempts, but order by started_at desc
-        # defensively so this always reflects their latest/actual attempt
-        # rather than an arbitrary row if any duplicates exist from before.
         sess = DBSession.query.filter_by(
             exam_id=exam_id, student_id=e.student_id
         ).order_by(DBSession.started_at.desc()).first()
@@ -513,10 +515,6 @@ def get_exam_students(exam_id):
         })
     return jsonify({"students": students})
 
-
-# ──────────────────────────────────────────────────────────────
-# EXAM QUESTIONS
-# ──────────────────────────────────────────────────────────────
 
 @app.route('/api/exams/<int:exam_id>/questions', methods=['GET'])
 def get_questions(exam_id):
@@ -534,7 +532,6 @@ def add_question(exam_id):
 
     data = request.json or {}
 
-    # Auto-set order number
     last = ExamQuestion.query.filter_by(
         exam_id=exam_id).order_by(
         ExamQuestion.order_num.desc()).first()
@@ -582,10 +579,6 @@ def delete_question(exam_id, q_id):
     return jsonify({"status": "deleted"})
 
 
-# ──────────────────────────────────────────────────────────────
-# PROCTORING SESSIONS
-# ──────────────────────────────────────────────────────────────
-
 @app.route('/api/session/start', methods=['POST'])
 def start_session():
     user, err = require_auth(roles=["student"])
@@ -599,12 +592,6 @@ def start_session():
     if not enrollment:
         return jsonify({"error": "Not enrolled in this exam"}), 403
 
-    # One attempt per student per exam. If a session already exists for
-    # this pairing: a finished one means they've already submitted (block
-    # a re-attempt); an unfinished one means the browser/tab was closed or
-    # crashed mid-exam (e.g. reload) — resume that same row instead of
-    # creating a brand new attempt, which is what let students submit the
-    # same exam multiple times before.
     existing = DBSession.query.filter_by(
         exam_id=exam_id, student_id=user.id
     ).order_by(DBSession.started_at.desc()).first()
@@ -616,9 +603,6 @@ def start_session():
     from backend.utils.tab_monitor     import TabMonitor
 
     if existing:
-        # Resume the interrupted attempt — same DB row, same token, but a
-        # fresh in-memory logger/tab monitor since the old ones (if the
-        # server restarted) no longer exist.
         db_session = existing
         token      = existing.session_token
     else:
@@ -665,7 +649,7 @@ def stop_session():
 
     data    = request.json or {}
     token   = data.get("session_token")
-    answers = data.get("answers", {})  # { question_id (str): selected_option (int) | text }
+    answers = data.get("answers", {})
     ps      = proctoring_sessions.get(token)
 
     if not ps:
@@ -700,11 +684,6 @@ def stop_session():
             )
             db.session.add(db_inc)
 
-        # Store what the student actually answered, and auto-grade MCQ
-        # questions against the correct_answer key. This is the piece that
-        # was previously missing entirely — the frontend tracked answers
-        # in React state but never sent them to the backend at all, so a
-        # lecturer had no way to see what a student submitted.
         questions = ExamQuestion.query.filter_by(exam_id=db_sess.exam_id).all()
         mcq_earned, mcq_total = 0, 0
         for q in questions:
@@ -712,7 +691,7 @@ def stop_session():
             if raw is None and q.id in answers:
                 raw = answers.get(q.id)
             if raw is None:
-                continue  # unanswered — no row, shows as blank to the lecturer
+                continue
 
             sa = StudentAnswer(session_id=db_sess_id, question_id=q.id)
             if q.question_type == "mcq":
@@ -726,7 +705,7 @@ def stop_session():
                 mcq_earned += sa.marks_awarded
             else:
                 sa.answer_text = str(raw)
-                sa.is_correct  = None  # essay — needs manual grading
+                sa.is_correct  = None
             db.session.add(sa)
 
         db_sess.auto_score = round(100 * mcq_earned / mcq_total, 1) if mcq_total else None
@@ -787,7 +766,6 @@ def log_incident():
         data.get("confidence", 0.0),
         details=data.get("details", ""),
     )
-
     if incident:
         socketio.emit('incident', {
             **incident,
@@ -797,10 +775,6 @@ def log_incident():
 
     return jsonify({"logged": True})
 
-
-# ──────────────────────────────────────────────────────────────
-# LECTURER DASHBOARD
-# ──────────────────────────────────────────────────────────────
 
 @app.route('/api/lecturer/sessions', methods=['GET'])
 def lecturer_sessions():
@@ -814,8 +788,6 @@ def lecturer_sessions():
             exam_id=int(exam_id)).order_by(
             DBSession.started_at.desc()).all()
     elif user.role == UserRole.ADMIN:
-        # Admins see every session across every lecturer's exams, not just
-        # ones they personally created (an admin usually hasn't created any).
         sessions = DBSession.query.order_by(DBSession.started_at.desc()).all()
     else:
         my_exams = Exam.query.filter_by(created_by=user.id).all()
@@ -860,9 +832,6 @@ def lecturer_session_detail(session_id):
     for a in answers:
         q = db.session.get(ExamQuestion, a.question_id)
         answer_list.append(a.to_dict(question=q))
-    # Keep them in question order rather than whatever order they were
-    # submitted/graded in, so the lecturer reads them top-to-bottom like
-    # the student saw them.
     if exam:
         order = {q.id: q.order_num for q in ExamQuestion.query.filter_by(exam_id=exam.id).all()}
         answer_list.sort(key=lambda a: order.get(a["question_id"], 0))
@@ -952,7 +921,6 @@ def send_grade():
 
     db.session.commit()
 
-    # Notify student in real time
     socketio.emit('grade_received', {
         "student_id": sess.student_id,
         "exam_id":    sess.exam_id,
@@ -974,10 +942,6 @@ def lecturer_students():
         role=UserRole.STUDENT, is_active=True).order_by(User.name).all()
     return jsonify({"students": [s.to_dict() for s in students]})
 
-
-# ──────────────────────────────────────────────────────────────
-# STUDENT ENDPOINTS
-# ──────────────────────────────────────────────────────────────
 
 @app.route('/api/student/results', methods=['GET'])
 def student_results():
@@ -1035,10 +999,6 @@ def student_notifications():
     return jsonify({"notifications": notifications})
 
 
-# ──────────────────────────────────────────────────────────────
-# PLAGIARISM
-# ──────────────────────────────────────────────────────────────
-
 @app.route('/api/plagiarism/check', methods=['POST'])
 def check_plagiarism():
     user, err = require_auth()
@@ -1056,15 +1016,11 @@ def check_plagiarism():
 
     from modules.nlp.plagiarism_detector import PlagiarismDetector, save_to_corpus
     detector = PlagiarismDetector()
-    report   = detector.analyze(fpath, use_semantic=True)
+
+    with _plagiarism_lock:
+        report = detector.analyze(fpath, use_semantic=True)
     detector.save_report(report)
 
-    # Add this submission to the corpus AFTER analysis (never before — that
-    # would let a document match against itself). This is what makes
-    # cross-student comparison start working at all: right now nothing
-    # ever populates the corpus, so every single check reports 100%
-    # originality regardless of content. Each new submission becomes a
-    # comparison point for every submission after it.
     save_to_corpus(fpath)
 
     ps = proctoring_sessions.get(session_token)
@@ -1151,10 +1107,6 @@ def recheck_exam_plagiarism(exam_id):
     exam, cross-comparing them against each other (not just the standing
     corpus) — catches copying between students that a check run at
     submission time would miss if the other student hadn't submitted yet.
-    Synchronous: for typical class sizes this finishes in well under the
-    request timeout, but scales with (submissions × submissions) since each
-    one is compared against every other, so a very large cohort would be
-    slow. Not built for that scale here.
     """
     user, err = require_auth(roles=["lecturer", "admin"])
     if err: return err
@@ -1174,12 +1126,8 @@ def recheck_exam_plagiarism(exam_id):
     from modules.nlp.plagiarism_detector import PlagiarismDetector
     from modules.nlp.document_parser import read_document, clean_text
 
-    # One detector instance for the whole batch — loading the classifier
-    # and lazy-loading the semantic model once, not once per submission.
     detector = PlagiarismDetector()
 
-    # Pre-read every submission once so the cross-comparison list is built
-    # from memory rather than re-reading the same files N times.
     texts = {}
     for r in reports:
         if r.file_path and os.path.exists(r.file_path):
@@ -1196,10 +1144,11 @@ def recheck_exam_plagiarism(exam_id):
         peer_corpus = [texts[other_id] for other_id in texts if other_id != r.id]
         own_corpus_name = os.path.basename(r.file_path) + ".txt"
 
-        report = detector.analyze(
-            r.file_path, use_semantic=True,
-            extra_corpus=peer_corpus, exclude_from_corpus=own_corpus_name,
-        )
+        with _plagiarism_lock:
+            report = detector.analyze(
+                r.file_path, use_semantic=True,
+                extra_corpus=peer_corpus, exclude_from_corpus=own_corpus_name,
+            )
         if "error" in report:
             skipped.append(r.file_name)
             continue
@@ -1219,10 +1168,6 @@ def recheck_exam_plagiarism(exam_id):
 
     return jsonify({"status": "done", "updated": len(updated), "skipped": skipped})
 
-
-# ──────────────────────────────────────────────────────────────
-# CALIBRATION
-# ──────────────────────────────────────────────────────────────
 
 @app.route('/api/calibration', methods=['POST'])
 def save_calibration():
@@ -1259,10 +1204,6 @@ def get_calibration():
     return jsonify({"profile": profile.to_dict()})
 
 
-# ──────────────────────────────────────────────────────────────
-# REPORTS
-# ──────────────────────────────────────────────────────────────
-
 @app.route('/api/report/<int:session_id>', methods=['GET'])
 def get_report(session_id):
     user, err = require_auth(roles=["lecturer", "admin"])
@@ -1279,7 +1220,7 @@ def get_report(session_id):
     exam    = db.session.get(Exam, sess.exam_id)
     report  = {
         **sess.to_dict(),
-        "student_name": student.name  if student else "Unknown",
+                "student_name": student.name  if student else "Unknown",
         "exam_title":   exam.title    if exam    else "Unknown",
         "incidents":    [i.to_dict() for i in sess.incidents],
     }
@@ -1292,6 +1233,7 @@ def get_screenshot(filename):
     if not os.path.exists(fpath):
         return jsonify({"error": "Not found"}), 404
     return send_file(fpath, mimetype='image/jpeg')
+
 
 @app.route('/api/session/identity_check', methods=['POST'])
 def log_identity_check():
@@ -1389,6 +1331,8 @@ def session_security_detail(session_id):
         "object_in_use_count":     sum(1 for o in sess.object_detections if o.in_use),
         "max_fusion_score":        max([f.score for f in sess.fusion_scores], default=0.0),
     })
+
+
 @app.route('/api/identity/register', methods=['POST'])
 def register_identity():
     """
@@ -1421,18 +1365,12 @@ def register_identity():
         return jsonify({"error": "Face verification model unavailable — contact support"}), 500
 
     if face_crop is None:
-        # This was previously unchecked — a photo with no clear face could
-        # be saved as the reference, guaranteeing every later verify call
-        # would fail against it regardless of who was on camera.
         return jsonify({"error": "No clear face detected in that photo — try again with better lighting, facing the camera directly."}), 400
 
     ref_dir  = "data/identity_references"
     os.makedirs(ref_dir, exist_ok=True)
     ref_path = os.path.join(ref_dir, f"student_{user.id}_ref.jpg")
 
-    # Store the tight crop, not the full frame — this is what verify will
-    # be compared against, and a pre-cropped reference gives ArcFace a
-    # cleaner, more consistent input than a full webcam frame would.
     cv2.imwrite(ref_path, face_crop)
 
     return jsonify({"status": "registered", "path": ref_path})
@@ -1446,6 +1384,8 @@ def identity_status():
 
     ref_path = os.path.join("data/identity_references", f"student_{user.id}_ref.jpg")
     return jsonify({"registered": os.path.exists(ref_path)})
+
+
 @app.route('/api/session/join', methods=['POST'])
 def join_session():
     """Desktop app links to an already-started browser session via a short code."""
@@ -1493,6 +1433,7 @@ def get_frame():
         return jsonify({"frame": None})
     return jsonify({"frame": ps["latest_frame"]})
 
+
 @app.route('/api/identity/verify', methods=['POST'])
 def verify_identity_snapshot():
     """
@@ -1525,55 +1466,30 @@ def verify_identity_snapshot():
         return jsonify({"is_match": None, "confidence": 0.0, "note": "Face verification model unavailable"})
 
     if face_crop is None:
-        # No face found by the landmarker — genuinely inconclusive, not the
-        # same as "identity confirmed". A different, unregistered face is
-        # at least as likely to fail detection as the right one is.
         return jsonify({"is_match": None, "confidence": 0.0, "note": "Face not clearly detected — check skipped"})
 
     try:
         from deepface import DeepFace
-        # detector_backend="opencv" (not "skip") + enforce_detection=True:
-        # "skip" was a mistake — it doesn't just skip *finding* the face,
-        # it also skips DeepFace's internal alignment step (leveling the
-        # eyes, standardizing the crop via facial landmarks), which ArcFace
-        # is highly sensitive to. Without it, embeddings for different
-        # people end up artificially close together, producing false
-        # "verified" matches — confirmed in testing: a different, clearly
-        # unregistered face was coming back as a match. Running OpenCV's
-        # detector on the already-cropped, face-filling MediaPipe crop
-        # (rather than the original full webcam frame) keeps this
-        # reliable — the original problem this was meant to fix — while
-        # keeping alignment intact. enforce_detection=True so a genuine
-        # detection failure raises instead of silently skipping alignment.
-        result = DeepFace.verify(
-            img1_path=face_crop, img2_path=ref_path,
-            model_name="ArcFace", detector_backend="opencv",
-            distance_metric="cosine", enforce_detection=True,
-        )
+        with _arcface_lock:
+            result = DeepFace.verify(
+                img1_path=face_crop, img2_path=ref_path,
+                model_name="ArcFace", detector_backend="opencv",
+                distance_metric="cosine", enforce_detection=True,
+            )
         is_match   = result["verified"]
         distance   = result["distance"]
         confidence = max(0.0, 1.0 - (distance / 0.68))
         note = None
     except ValueError as e:
-        # DeepFace raises ValueError specifically when its detector can't
-        # find a face in one of the two images — genuinely inconclusive,
-        # not "identity confirmed". A different, unregistered face is at
-        # least as likely to fail detection as the right one is.
         is_match, distance, confidence = None, None, 0.0
         note = "Face not clearly detected — check skipped"
         print(f"[identity/verify] face not detected: {e}")
     except Exception as e:
-        # Any other unexpected error (model load failure, corrupt image,
-        # etc.) — also inconclusive, and logged loudly so it doesn't go
-        # unnoticed instead of being silently converted into a "match".
         is_match, distance, confidence = None, None, 0.0
         note = "Verification error — check skipped"
         print(f"[identity/verify] error: {e}")
 
     ps = proctoring_sessions.get(token)
-    # Only persist a real IdentityCheck row when we actually reached a
-    # determination — inconclusive checks aren't evidence of anything and
-    # would just dilute the identity_mismatch_count on the lecturer side.
     if ps and is_match is not None:
         check = IdentityCheck(
             session_id=ps["db_session_id"], student_id=user.id,
@@ -1598,23 +1514,31 @@ def detect_object_snapshot():
     if "," in image_b64:
         image_b64 = image_b64.split(",")[1]
 
-    img_bytes = base64.b64decode(image_b64)
-    nparr     = np.frombuffer(img_bytes, np.uint8)
-    frame     = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    try:
+        img_bytes = base64.b64decode(image_b64)
+        nparr     = np.frombuffer(img_bytes, np.uint8)
+        frame     = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("Could not decode image")
 
-    from modules.vision.object_detector import ObjectDetector
-    if not hasattr(app, '_object_detector'):
-        app._object_detector = ObjectDetector()
+        # _yolo_lock no longer guards against a native-library race —
+        # YOLO now runs in its own isolated subprocess (see bootstrap()
+        # and modules/vision/yolo_worker.py). It still matters here:
+        # multiple Flask threads calling detect() concurrently on the
+        # SAME queue pair could otherwise read back a different thread's
+        # result, so the lock keeps each "send frame, wait for its
+        # matching response" round trip atomic.
+        if not hasattr(app, '_yolo_worker'):
+            raise RuntimeError("YOLO worker is not available (failed to start at server startup)")
 
-    detections = app._object_detector.detect(frame)
+        with _yolo_lock:
+            detections = app._yolo_worker.detect(frame, timeout=8.0)
+    except Exception as e:
+        print(f"[object/detect] ERROR: {e}")
+        return jsonify({"error": str(e), "detections": []}), 500
 
     ps = proctoring_sessions.get(token)
     if ps:
-        # Keep the most recent frame (as a data URL) so the lecturer's live
-        # monitor can poll it and show something real instead of a static
-        # placeholder — this is a periodic still image, not true video, but
-        # it's the only frame data the server ever receives from the
-        # student in the first place.
         ps["last_frame"]    = f"data:image/jpeg;base64,{image_b64}"
         ps["last_frame_at"] = time.time()
 
@@ -1623,7 +1547,7 @@ def detect_object_snapshot():
             event = ObjectDetectionEvent(
                 session_id=ps["db_session_id"], object_class=det["class"],
                 raw_class=det["raw_class"], confidence=det["confidence"],
-                in_use=False,  # hand-proximity check happens client-side separately
+                in_use=False,
             )
             db.session.add(event)
     if ps and detections:
@@ -1633,9 +1557,48 @@ def detect_object_snapshot():
         {"class": d["class"], "confidence": d["confidence"]} for d in detections
     ]})
 
-# ──────────────────────────────────────────────────────────────
-# WEBSOCKET
-# ──────────────────────────────────────────────────────────────
+
+@app.route('/api/audio/classify', methods=['POST'])
+def classify_audio_clip():
+    """
+    Browser posts a short WAV clip (~2s) periodically. Runs it through the
+    trained CNN+LightGBM ensemble (paper/loud/silence/ambient only — whisper
+    and speech remain the continuous rule-based classifier's job client-side,
+    since ESC-50 has no true whisper class).
+    """
+    import base64, tempfile
+    user, err = require_auth(roles=["student"])
+    if err: return err
+
+    data      = request.json or {}
+    token     = data.get("session_token")
+    audio_b64 = data.get("audio", "")
+    if "," in audio_b64:
+        audio_b64 = audio_b64.split(",")[1]
+
+    try:
+        audio_bytes = base64.b64decode(audio_b64)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        with _audio_lock:
+            label, confidence = predict_from_file(tmp_path)
+        os.unlink(tmp_path)
+    except Exception as e:
+        print(f"[audio/classify] ERROR: {e}")
+        return jsonify({"error": str(e), "label": None}), 500
+
+    ps = proctoring_sessions.get(token)
+    if ps and label in ("paper", "loud") and confidence > 0.55:
+        incident_type = "AUDIO_PAPER" if label == "paper" else "AUDIO_LOUD"
+        incident = ps["logger"].log(incident_type, confidence,
+                                      details=f"Trained audio ensemble: {label} ({confidence:.0%})")
+        if incident:
+            socketio.emit('incident', {**incident, "session_token": token, "student_id": ps["student_id"]})
+
+    return jsonify({"label": label, "confidence": confidence})
+
 
 @socketio.on('connect')
 def on_connect():
@@ -1658,18 +1621,11 @@ def on_ping():
     emit('pong', {"time": time.time()})
 
 
-# ──────────────────────────────────────────────────────────────
-# BACKGROUND BROADCAST
-# ──────────────────────────────────────────────────────────────
-
 def broadcast_status():
     while True:
         time.sleep(2)
         try:
             if proctoring_sessions:
-                # Any DB access (db.session.get, etc.) from a background
-                # thread MUST be wrapped in an app context, or Flask-SQLAlchemy
-                # raises "RuntimeError: Working outside of application context."
                 with app.app_context():
                     live = []
                     for token, ps in list(proctoring_sessions.items()):
@@ -1686,15 +1642,15 @@ def broadcast_status():
                         })
                     socketio.emit('live_update', {"sessions": live})
         except Exception as e:
-            # Never let an unexpected error kill this daemon thread forever —
-            # log it and keep the broadcast loop alive for the next tick.
             print(f"[broadcast_status] error: {e}")
-
-status_thread = threading.Thread(target=broadcast_status, daemon=True)
-status_thread.start()
 
 
 if __name__ == "__main__":
+    bootstrap()
+
+    status_thread = threading.Thread(target=broadcast_status, daemon=True)
+    status_thread.start()
+
     print("TrueWatch API v2.1 starting...")
     print("Endpoints available at: http://localhost:5001")
     print("")
@@ -1703,7 +1659,9 @@ if __name__ == "__main__":
     print("  Exams:        GET  /api/exams")
     print("  Session:      POST /api/session/start")
     print("  Plagiarism:   POST /api/plagiarism/check")
+    print("  Audio:        POST /api/audio/classify")
     print("  Lecturer:     GET  /api/lecturer/live")
     print("  Admin:        GET  /api/admin/users")
     print("")
     socketio.run(app, host='0.0.0.0', port=5001, debug=False)
+    

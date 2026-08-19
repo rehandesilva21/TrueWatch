@@ -26,6 +26,7 @@ const SCORE_PENALTY = {
   AUDIO_LOUD:          2,
   AUDIO_WHISPER:       2,
   AUDIO_SPEECH:        1.5,
+  AUDIO_PAPER:         1.5,
   GAZE:                1,
   HEAD:                1,
   LIP:                 0.5,
@@ -33,12 +34,9 @@ const SCORE_PENALTY = {
 
 const IDENTITY_CHECK_INTERVAL_MS = 10000
 const OBJECT_CHECK_INTERVAL_MS   = 3000
-// How often the browser posts its own rule-based aggregate score to
-// /session/fusion_score. This is NOT the trained LSTM model — that only
-// ran in the old desktop cv2 pipeline, which no longer exists now that
-// detection is fully client-side. This is a clearly-labeled substitute
-// so the fusion_scores table isn't just permanently empty.
 const RULE_SCORE_PUSH_INTERVAL_MS = 15000
+const AUDIO_CLIP_INTERVAL_MS = 8000
+const PERIODIC_REQUEST_TIMEOUT_MS = 12000
 
 const scoreColor = (score) => score >= 90 ? '#027A48' : score >= 70 ? '#B54708' : '#B42318'
 const scoreBadgeClass = (score) => score >= 90 ? 'exam-badge-success' : score >= 70 ? 'exam-badge-warning' : 'exam-badge-danger'
@@ -48,6 +46,15 @@ const IDENTITY_META = {
   verifying: { label: 'Verifying…',        cls: 'exam-badge-warning' },
   verified:  { label: 'Identity verified', cls: 'exam-badge-success' },
   mismatch:  { label: 'Identity mismatch', cls: 'exam-badge-danger'  },
+}
+
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onloadend = () => resolve(reader.result)
+    reader.onerror = reject
+    reader.readAsDataURL(blob)
+  })
 }
 
 export default function ExamRoom() {
@@ -76,7 +83,7 @@ export default function ExamRoom() {
   const [score,          setScore]          = useState(100)
   const [identityStatus, setIdentityStatus] = useState('pending')
   const [isDocumentExam, setIsDocumentExam] = useState(null)
-  const [incidentCount,  setIncidentCount]  = useState(0) // visible proof logging is working
+  const [incidentCount,  setIncidentCount]  = useState(0)
 
   const videoRef   = useRef(null)
   const streamRef  = useRef(null)
@@ -90,17 +97,24 @@ export default function ExamRoom() {
   const scoreRef        = useRef(100)
   const lastLoggedAt    = useRef({})
   const counters   = useRef({ gaze: 0, head: 0, lip: 0, absent: 0, tabSwitches: 0 })
-  const lastSnapshotAt = useRef({ identity: 0, object: 0, fusion: 0 })
+  const lastSnapshotAt = useRef({ identity: 0, object: 0, fusion: 0, audioClip: 0 })
   const answersRef = useRef({})
   const isDocumentExamRef = useRef(false)
+  const warningIdRef = useRef(0)
+  const inFlightRef = useRef({ object: false, identity: false, audioClip: false })
 
   const { load: loadFace, detect: detectFace } = useFaceMonitor()
-  const { start: startAudio, stop: stopAudio, calibrateBackground, classify: classifyAudio } = useAudioMonitor()
+  const {
+    start: startAudio, stop: stopAudio, calibrateBackground,
+    classify: classifyAudio, recordClip,
+  } = useAudioMonitor()
 
   useEffect(() => { answersRef.current = answers }, [answers])
 
   const pushWarning = (type, details) => {
-    setWarnings(prev => [{ id: Date.now(), type, details, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 8))
+    warningIdRef.current += 1
+    const id = `${Date.now()}-${warningIdRef.current}`
+    setWarnings(prev => [{ id, type, details, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 8))
   }
 
   const applyScorePenalty = (type) => {
@@ -121,10 +135,6 @@ export default function ExamRoom() {
 
     try {
       const res = await API.post('/session/incident', { session_token: sessionTokenRef.current, type, confidence, details })
-      // Visible, honest confirmation that a POST actually landed and was
-      // logged — not just that the network call didn't throw. This is
-      // what proved the resume-overwrite bug: the request always
-      // succeeded (200), the bug was server-side state being wiped.
       if (res.data?.logged) {
         setIncidentCount(c => c + 1)
       }
@@ -148,12 +158,6 @@ export default function ExamRoom() {
         setIsDocumentExam(docOnly)
         isDocumentExamRef.current = docOnly
 
-        // Identity verification is mandatory before an MCQ exam can start —
-        // ExamRoom polls /identity/verify throughout the exam, but that's
-        // meaningless if there's no reference photo to check against: the
-        // backend returns is_match: null (inconclusive) for the entire
-        // session and nothing ever actually gets verified. Document exams
-        // have no webcam monitoring at all, so this doesn't apply there.
         if (!docOnly) {
           const idRes = await API.get('/identity/status').catch(() => ({ data: { registered: false } }))
           if (!idRes.data.registered) {
@@ -164,15 +168,6 @@ export default function ExamRoom() {
 
         const calibRes = await API.get('/calibration').catch(() => ({ data: { profile: null } }))
 
-        // Document exams have no webcam/behavioral monitoring at all (see
-        // CreateExam.jsx), so calibration is irrelevant there — only MCQ
-        // exams need it. For those, a missing profile isn't optional the
-        // way it silently was before: without it there's no way for a
-        // student to declare an eye condition, and gaze/head tolerances
-        // fall back to generic defaults that don't account for anyone.
-        // The desktop app runs this unconditionally before every session
-        // (run_eye_condition_check); the web app now matches that instead
-        // of quietly proceeding with one-size-fits-all thresholds.
         if (!docOnly && !calibRes.data.profile) {
           navigate('/calibration', { state: { redirectTo: `/exam/${examId}` } })
           return
@@ -274,85 +269,116 @@ export default function ExamRoom() {
 
   const detectionLoop = () => {
     const tick = () => {
-      if (faceReadyRef.current) {
-        const result = detectFace(videoRef.current, performance.now())
+      try {
+        if (faceReadyRef.current) {
+          const result = detectFace(videoRef.current, performance.now())
 
-        if (result) {
-          if (result.faceCount === 0) {
-            counters.current.absent += 1
-            if (counters.current.absent === ALERT_FRAMES) logIncident('ABSENT', 0.99, 'No face detected')
-          } else {
-            counters.current.absent = 0
-          }
+          if (result) {
+            if (result.faceCount === 0) {
+              counters.current.absent += 1
+              if (counters.current.absent === ALERT_FRAMES) logIncident('ABSENT', 0.99, 'No face detected')
+            } else {
+              counters.current.absent = 0
+            }
 
-          if (result.faceCount > 1) {
-            logIncident('MULTI_FACE', 0.99, `${result.faceCount} faces detected`)
-          }
+            if (result.faceCount > 1) {
+              logIncident('MULTI_FACE', 0.99, `${result.faceCount} faces detected`)
+            }
 
-          const calib = calibrationRef.current
-          if (result.faceCount === 1 && calib) {
-            const gazeDev = Math.abs(result.gaze - calib.gaze_baseline) > calib.gaze_tolerance
-            const headDev = Math.abs(result.head - calib.head_baseline) > calib.head_tolerance
-            const lipDev  = Math.abs(result.lip  - calib.lip_baseline)  > 0.04
+            const calib = calibrationRef.current
+            if (result.faceCount === 1 && calib) {
+              const gazeDev = Math.abs(result.gaze - calib.gaze_baseline) > calib.gaze_tolerance
+              const headDev = Math.abs(result.head - calib.head_baseline) > calib.head_tolerance
+              const lipDev  = Math.abs(result.lip  - calib.lip_baseline)  > 0.04
 
-            counters.current.gaze = gazeDev ? counters.current.gaze + 1 : 0
-            counters.current.head = headDev ? counters.current.head + 1 : 0
-            counters.current.lip  = lipDev  ? counters.current.lip  + 1 : 0
+              counters.current.gaze = gazeDev ? counters.current.gaze + 1 : 0
+              counters.current.head = headDev ? counters.current.head + 1 : 0
+              counters.current.lip  = lipDev  ? counters.current.lip  + 1 : 0
 
-            if (counters.current.gaze === ALERT_FRAMES) logIncident('GAZE', 0.85, 'Looking away from screen')
-            if (counters.current.head === ALERT_FRAMES) logIncident('HEAD', 0.85, 'Head turned away')
-            if (counters.current.lip  === ALERT_FRAMES) logIncident('LIP', 0.7, 'Sustained lip movement')
+              if (counters.current.gaze === ALERT_FRAMES) logIncident('GAZE', 0.85, 'Looking away from screen')
+              if (counters.current.head === ALERT_FRAMES) logIncident('HEAD', 0.85, 'Head turned away')
+              if (counters.current.lip  === ALERT_FRAMES) logIncident('LIP', 0.7, 'Sustained lip movement')
+            }
           }
         }
-      }
 
-      const audio = classifyAudio()
-      setAudioClass(audio.class)
-      if (audio.alert && audio.class === 'loud')    logIncident('AUDIO_LOUD', 0.8, 'Loud voice detected')
-      if (audio.alert && audio.class === 'whisper') logIncident('AUDIO_WHISPER', 0.75, 'Whisper detected')
-      if (audio.alert && audio.class === 'speech')  logIncident('AUDIO_SPEECH', 0.7, 'Voice detected')
+        // Continuous rule-based classifier — drives the live audio badge
+        // and catches whisper/speech/loud, which the periodic trained
+        // ensemble (every 8s) could otherwise miss for a short burst.
+        // FIX: 'loud' previously had no incident trigger at all here —
+        // only the rule-based badge updated, so a loud-talking event
+        // never actually got logged unless the 8-second server-side
+        // audio-clip check happened to land during it.
+        const audio = classifyAudio()
+        setAudioClass(audio.class)
+        if (audio.alert && audio.class === 'loud')    logIncident('AUDIO_LOUD', 0.8, 'Loud voice detected')
+        if (audio.alert && audio.class === 'whisper') logIncident('AUDIO_WHISPER', 0.75, 'Whisper detected')
+        if (audio.alert && audio.class === 'speech')  logIncident('AUDIO_SPEECH', 0.7, 'Voice detected')
 
-      const now = performance.now()
-      if (now - lastSnapshotAt.current.object > OBJECT_CHECK_INTERVAL_MS) {
-        lastSnapshotAt.current.object = now
-        postSnapshot('/object/detect')
+        const now = performance.now()
+        if (now - lastSnapshotAt.current.object > OBJECT_CHECK_INTERVAL_MS) {
+          lastSnapshotAt.current.object = now
+          postSnapshot('/object/detect', 'object')
+        }
+        if (now - lastSnapshotAt.current.identity > IDENTITY_CHECK_INTERVAL_MS) {
+          lastSnapshotAt.current.identity = now
+          setIdentityStatus(prev => prev === 'verified' ? prev : 'verifying')
+          postSnapshot('/identity/verify', 'identity')
+        }
+        if (now - lastSnapshotAt.current.fusion > RULE_SCORE_PUSH_INTERVAL_MS) {
+          lastSnapshotAt.current.fusion = now
+          pushRuleScore()
+        }
+        if (now - lastSnapshotAt.current.audioClip > AUDIO_CLIP_INTERVAL_MS) {
+          lastSnapshotAt.current.audioClip = now
+          postAudioClip()
+        }
+      } catch (err) {
+        console.error('[ExamRoom] Detection tick failed, continuing loop:', err)
+      } finally {
+        rafRef.current = requestAnimationFrame(tick)
       }
-      if (now - lastSnapshotAt.current.identity > IDENTITY_CHECK_INTERVAL_MS) {
-        lastSnapshotAt.current.identity = now
-        setIdentityStatus(prev => prev === 'verified' ? prev : 'verifying')
-        postSnapshot('/identity/verify')
-      }
-      if (now - lastSnapshotAt.current.fusion > RULE_SCORE_PUSH_INTERVAL_MS) {
-        lastSnapshotAt.current.fusion = now
-        pushRuleScore()
-      }
-
-      rafRef.current = requestAnimationFrame(tick)
     }
     rafRef.current = requestAnimationFrame(tick)
   }
 
-  // Posts the browser's own rule-based integrity score to the
-  // fusion_scores table. Clearly a different signal from the trained
-  // LSTM fusion model (which only ever ran in the deprecated desktop
-  // pipeline) — this exists so the table has real data instead of being
-  // permanently empty now that detection is fully client-side.
   const pushRuleScore = async () => {
     if (!sessionTokenRef.current) return
     try {
       await API.post('/session/fusion_score', {
         session_token: sessionTokenRef.current,
-        score: +(1 - scoreRef.current / 100).toFixed(4), // 0 = clean, 1 = high risk
+        score: +(1 - scoreRef.current / 100).toFixed(4),
         feature_vector: null,
-      })
+      }, { timeout: PERIODIC_REQUEST_TIMEOUT_MS })
     } catch (err) {
       console.error('[ExamRoom] Failed to push rule score:', err?.message || err)
     }
   }
 
-  const postSnapshot = async (endpoint) => {
+  const postAudioClip = async () => {
+    if (!sessionTokenRef.current) return
+    if (inFlightRef.current.audioClip) return
+    inFlightRef.current.audioClip = true
+    try {
+      const wavBlob = await recordClip(2000)
+      const audioDataUrl = await blobToDataURL(wavBlob)
+      await API.post('/audio/classify', {
+        session_token: sessionTokenRef.current,
+        audio: audioDataUrl,
+      }, { timeout: PERIODIC_REQUEST_TIMEOUT_MS })
+    } catch (err) {
+      console.error('[ExamRoom] audio clip cycle failed:', err?.response?.data || err?.message)
+    } finally {
+      inFlightRef.current.audioClip = false
+    }
+  }
+
+  const postSnapshot = async (endpoint, kind) => {
     if (!videoRef.current || videoRef.current.readyState < 2) return
     if (!sessionTokenRef.current) return
+    if (inFlightRef.current[kind]) return
+    inFlightRef.current[kind] = true
+
     const canvas = document.createElement('canvas')
     canvas.width  = videoRef.current.videoWidth
     canvas.height = videoRef.current.videoHeight
@@ -360,7 +386,7 @@ export default function ExamRoom() {
     const image = canvas.toDataURL('image/jpeg', 0.7)
 
     try {
-      const res = await API.post(endpoint, { session_token: sessionTokenRef.current, image })
+      const res = await API.post(endpoint, { session_token: sessionTokenRef.current, image }, { timeout: PERIODIC_REQUEST_TIMEOUT_MS })
       if (endpoint === '/identity/verify') {
         if (res.data.is_match === false) {
           setIdentityStatus('mismatch')
@@ -368,10 +394,6 @@ export default function ExamRoom() {
         } else if (res.data.is_match === true) {
           setIdentityStatus('verified')
         } else {
-          // is_match === null: genuinely inconclusive (no reference yet,
-          // or this one frame's face wasn't clearly detected). Don't leave
-          // the badge stuck on "Verifying…" — fall back to whatever we
-          // last knew, so a single bad frame doesn't look like a hang.
           setIdentityStatus(prev => prev === 'verifying' ? 'pending' : prev)
         }
       }
@@ -379,11 +401,10 @@ export default function ExamRoom() {
         res.data.detections.forEach(d => logIncident('PROHIBITED_OBJECT', d.confidence, `${d.class} detected`))
       }
     } catch (err) {
-      // Previously silent — now visible so a broken snapshot endpoint
-      // (e.g. YOLO throwing, a bad base64 image) shows up in the console
-      // instead of vanishing without a trace.
       console.error(`[ExamRoom] ${endpoint} failed:`, err?.response?.data || err?.message || err)
       if (endpoint === '/identity/verify') setIdentityStatus('pending')
+    } finally {
+      inFlightRef.current[kind] = false
     }
   }
 
@@ -424,7 +445,7 @@ export default function ExamRoom() {
     stopAudio()
     try {
       const payload = { session_token: sessionTokenRef.current, answers: answersRef.current }
-      await API.post('/session/stop', payload)
+      await API.post('/session/stop', payload, { timeout: 20000 })
     } catch (err) {
       console.error('[ExamRoom] Submit failed:', err)
     }
