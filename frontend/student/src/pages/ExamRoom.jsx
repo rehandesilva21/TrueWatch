@@ -80,6 +80,8 @@ export default function ExamRoom() {
   const [loadError,      setLoadError]      = useState('')
   const [submitting,     setSubmitting]     = useState(false)
   const [showConfirm,    setShowConfirm]    = useState(false)
+  const [showLeaveConfirm, setShowLeaveConfirm] = useState(false)
+  const [leaving,        setLeaving]        = useState(false)
   const [calibration,    setCalibration]    = useState(null)
   const [monitorError,   setMonitorError]   = useState('')
   const [faceReady,      setFaceReady]      = useState(false)
@@ -107,18 +109,6 @@ export default function ExamRoom() {
   const inFlightRef = useRef({ object: false, identity: false, audioClip: false })
   const lastObjectDetectedRef = useRef(false)
   const lastTabSwitchAtRef    = useRef(0)
-  // Mirrors the fusion model's `ready` state into a ref, following the
-  // exact same pattern already used for faceReadyRef above. tick() is
-  // created once and re-schedules itself via requestAnimationFrame
-  // forever — it never gets recreated on a new render — so any plain
-  // React state it closes over (like `fusionReady`) stays frozen at
-  // whatever value existed on the render that created it, which is
-  // `false`, since loadFusion() hasn't resolved yet at that point. That
-  // stale closure was the actual reason zero fusion_score requests were
-  // ever firing, even though the model itself loaded correctly:
-  // runFusionInference's `if (!fusionReady) return` was permanently
-  // seeing the frozen initial value. Reading fusionReadyRef.current
-  // instead gives tick() a live value on every call.
   const fusionReadyRef = useRef(false)
 
   const { load: loadFace, detect: detectFace } = useFaceMonitor()
@@ -231,11 +221,43 @@ export default function ExamRoom() {
     }
     init()
 
-    const handleTabAway = (reason) => {
+    // IMPORTANT: only call getFocusedApp if it actually exists as a
+    // function. Electron's main process and preload script are loaded
+    // ONCE at app startup and are never hot-reloaded by Vite. If
+    // preload.js is edited while `electron:dev` is still running from
+    // before that edit, window.electronAPI here is stale and won't have
+    // this method yet, requiring a full restart of `npm run
+    // electron:dev` (not just a page refresh) to pick it up. The
+    // typeof check + inner try/catch mean stale/missing state can never
+    // break tab-switch detection itself — at worst it falls back to the
+    // generic browser message, exactly like running in a plain browser
+    // tab, and the LSTM's tabSwitchRecent feature (via
+    // lastTabSwitchAtRef, unchanged below) keeps working either way.
+    const hasElectronFocusApi = typeof window.electronAPI?.getFocusedApp === 'function'
+    console.log('[ExamRoom] Electron focus API available:', hasElectronFocusApi, 'window.electronAPI =', window.electronAPI)
+
+    const handleTabAway = async (reason) => {
       if (isDocumentExamRef.current) return
       counters.current.tabSwitches += 1
       lastTabSwitchAtRef.current = performance.now()
-      logIncident('TAB_SWITCH', 0.99, `Switched away from exam (${reason})`)
+
+      let details = `Switched away from exam (${reason})`
+      try {
+        // In Electron, ask the OS what's actually focused right now —
+        // this is the supervisor-flagged "golden point" feature, only
+        // possible because Electron has real OS-level access a browser
+        // tab is deliberately never granted.
+        if (hasElectronFocusApi) {
+          const info = await window.electronAPI.getFocusedApp()
+          if (info?.appName) details = `Switched to ${info.appName} (${reason})`
+        }
+      } catch (err) {
+        // Never let an Electron-side failure prevent the base incident
+        // from being logged — fall through to the generic message above.
+        console.error('[ExamRoom] getFocusedApp failed, using generic message:', err?.message || err)
+      }
+
+      logIncident('TAB_SWITCH', 0.99, details)
     }
     const handleVisibility = () => { if (document.hidden) handleTabAway('tab hidden') }
     const handleBlur       = () => handleTabAway('window lost focus')
@@ -298,7 +320,7 @@ export default function ExamRoom() {
   }
 
   const runFusionInference = (gazeDev, headDev, lipDev, faceCount, audio) => {
-    if (!fusionReadyRef.current) return   // FIX: was `if (!fusionReady) return` — stale closure
+    if (!fusionReadyRef.current) return
 
     const tabSwitchRecent = (performance.now() - lastTabSwitchAtRef.current) < TAB_SWITCH_RECENT_WINDOW_MS
 
@@ -505,6 +527,26 @@ export default function ExamRoom() {
     navigate('/', { state: { examSubmitted: true } })
   }
 
+  // Leaving WITHOUT submitting — reachable from the back button at any
+  // point, including mid-exam. This deliberately does NOT call
+  // /session/stop, so the session is left in its current "started, not
+  // ended" state server-side rather than being marked as a proper
+  // submission. This is not a new integrity gap: a student could already
+  // reach the exact same outcome today by simply quitting the whole
+  // Electron app (Cmd+Q) or closing the window, which this code has no
+  // way to prevent either. All this adds is a clean, honest in-app path
+  // to the same place, with the camera/mic/fusion model properly
+  // released either way.
+  const handleLeave = () => {
+    if (leaving) return
+    setLeaving(true)
+    cancelAnimationFrame(rafRef.current)
+    clearInterval(timerRef.current)
+    streamRef.current?.getTracks().forEach(t => t.stop())
+    stopAudio()
+    navigate('/')
+  }
+
   const q = questions[currentQ]
   const sColor = scoreColor(score)
   const idMeta = IDENTITY_META[identityStatus]
@@ -525,36 +567,48 @@ export default function ExamRoom() {
     <div className="exam-shell min-h-screen flex flex-col">
 
       {loading && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-white/70">
+        <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-white/70 gap-4">
           <div className="w-6 h-6 border-2 border-gray-900 rounded-full animate-spin" style={{ borderTopColor: 'transparent' }} />
+          <button onClick={() => navigate('/')} className="text-xs font-medium text-gray-500 hover:text-gray-700 underline">
+            Cancel and go back
+          </button>
         </div>
       )}
 
-      <div className="exam-topbar px-5 py-3 flex items-center justify-between sticky top-0 z-10">
-        <div className="flex items-center gap-2.5">
-          <div className="w-7 h-7 rounded-md bg-gray-900 flex items-center justify-center">
+      <div className="exam-topbar px-3 sm:px-5 py-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 sticky top-0 z-10">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <button
+            onClick={() => (loading || loadError) ? navigate('/') : setShowLeaveConfirm(true)}
+            aria-label="Back to dashboard"
+            className="w-7 h-7 rounded-md flex items-center justify-center shrink-0 text-gray-500 hover:bg-gray-100 hover:text-gray-800 transition-colors"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M15 18l-6-6 6-6" />
+            </svg>
+          </button>
+          <div className="w-7 h-7 rounded-md bg-gray-900 flex items-center justify-center shrink-0">
             <span className="text-white text-[11px] font-bold">TW</span>
           </div>
-          <span className="font-medium text-sm text-gray-800">{exam?.title}</span>
+          <span className="font-medium text-sm text-gray-800 truncate max-w-[140px] sm:max-w-none">{exam?.title}</span>
         </div>
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-2 sm:gap-2.5 flex-wrap justify-end">
           {!isDocumentExam && (
-            <span className={`exam-badge ${idMeta.cls}`}>{idMeta.label}</span>
+            <span className={`exam-badge ${idMeta.cls} hidden xs:inline-flex`}>{idMeta.label}</span>
           )}
           {!isDocumentExam && (
             <span className={`exam-badge ${scoreBadgeClass(score)} tabular-nums`}>
               {score.toFixed(0)} / 100
             </span>
           )}
-          <span className="text-base font-semibold tabular-nums" style={{ color: timeColor }}>{formatTime(timeLeft)}</span>
+          <span className="text-sm sm:text-base font-semibold tabular-nums" style={{ color: timeColor }}>{formatTime(timeLeft)}</span>
           <button onClick={() => setShowConfirm(true)} className="exam-btn-danger">
             Submit exam
           </button>
         </div>
       </div>
 
-      <div className="flex-1 flex gap-4 p-4 max-w-7xl mx-auto w-full">
-        <div className="w-80 shrink-0 space-y-4">
+      <div className="flex-1 flex flex-col md:flex-row gap-4 p-3 sm:p-4 max-w-7xl mx-auto w-full">
+        <div className="w-full md:w-80 shrink-0 space-y-4 order-2 md:order-1">
 
           {monitorError && !isDocumentExam && (
             <div className="exam-card p-3 border-amber-200 bg-amber-50">
@@ -615,7 +669,8 @@ export default function ExamRoom() {
                 {warnings.map(w => (
                   <div key={w.id} className="px-3 py-2 rounded-md text-xs bg-amber-50 text-amber-800">
                     <p className="font-medium">{w.type.replace(/_/g, ' ')}</p>
-                    <p className="opacity-70">{w.time}</p>
+                    {w.details && <p className="mt-0.5">{w.details}</p>}
+                    <p className="opacity-70 mt-0.5">{w.time}</p>
                   </div>
                 ))}
               </div>
@@ -663,9 +718,9 @@ export default function ExamRoom() {
           )}
         </div>
 
-        <div className="flex-1">
+        <div className="flex-1 min-w-0 order-1 md:order-2">
           {!isDocumentExam && q && (
-            <div className="exam-card p-7 max-w-2xl">
+            <div className="exam-card p-4 sm:p-7 max-w-2xl">
               <div className="flex items-center justify-between mb-5">
                 <span className="text-xs font-medium text-gray-500">Question {currentQ + 1} of {questions.length}</span>
                 <span className="exam-badge exam-badge-neutral">{q.marks || 5} marks</span>
@@ -691,12 +746,12 @@ export default function ExamRoom() {
                           value={answers[q.id] || ''} onChange={e => selectAnswer(q.id, e.target.value)} />
               )}
 
-              <div className="flex justify-between items-center mt-7">
+              <div className="flex flex-wrap gap-3 justify-between items-center mt-7">
                 <button onClick={() => setCurrentQ(Math.max(0, currentQ - 1))} disabled={currentQ === 0}
-                        className="exam-btn-secondary disabled:opacity-40">Previous</button>
-                <span className="text-xs text-gray-500">{Object.keys(answers).length} / {questions.length} answered</span>
+                        className="exam-btn-secondary disabled:opacity-40 order-1">Previous</button>
+                <span className="text-xs text-gray-500 order-3 sm:order-2 w-full sm:w-auto text-center">{Object.keys(answers).length} / {questions.length} answered</span>
                 <button onClick={() => setCurrentQ(Math.min(questions.length - 1, currentQ + 1))} disabled={currentQ === questions.length - 1}
-                        className="exam-btn-primary disabled:opacity-40">Next</button>
+                        className="exam-btn-primary disabled:opacity-40 order-2 sm:order-3">Next</button>
               </div>
             </div>
           )}
@@ -723,6 +778,28 @@ export default function ExamRoom() {
               <button onClick={() => setShowConfirm(false)} className="exam-btn-secondary flex-1 justify-center">Go back</button>
               <button onClick={handleSubmit} disabled={submitting} className="exam-btn-danger flex-1 justify-center">
                 {submitting ? 'Submitting…' : 'Submit'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showLeaveConfirm && (
+        <div className="fixed inset-0 flex items-center justify-center z-50 p-6 bg-black/40">
+          <div className="exam-card p-7 max-w-sm w-full">
+            <h2 className="text-base font-semibold text-gray-900 mb-2">Leave without submitting?</h2>
+            <p className="text-sm mb-1 text-gray-500">
+              {Object.keys(answers).length > 0
+                ? `You've answered ${Object.keys(answers).length} of ${questions.length} questions — this progress will not be saved.`
+                : "You haven't submitted anything for this exam yet."}
+            </p>
+            <p className="text-xs text-gray-400 mb-4">
+              This exam will remain open, but you'll need to return and submit it properly before the time limit ends.
+            </p>
+            <div className="flex gap-3 mt-2">
+              <button onClick={() => setShowLeaveConfirm(false)} className="exam-btn-secondary flex-1 justify-center">Stay</button>
+              <button onClick={handleLeave} disabled={leaving} className="exam-btn-danger flex-1 justify-center">
+                {leaving ? 'Leaving…' : 'Leave exam'}
               </button>
             </div>
           </div>

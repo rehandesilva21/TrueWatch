@@ -39,21 +39,21 @@ export default function Settings() {
         <h1 className="text-[28px] font-semibold tracking-tight mb-7">Settings</h1>
 
         <div className="glass-panel overflow-hidden mb-5">
-          <div className="px-5 py-4 flex items-center justify-between">
-            <div>
+          <div className="px-5 py-4 flex flex-wrap gap-3 items-center justify-between">
+            <div className="min-w-0">
               <p className="text-sm font-medium">Identity verification</p>
               <p className="text-xs mt-0.5" style={{ color: 'var(--ink-soft)' }}>
                 {identityRegistered === null
                   ? 'Checking...'
                   : identityRegistered
-                    ? 'Your reference photo is on file — used to confirm it\u2019s you during exams.'
+                    ? 'Your reference photo is on file — used to confirm it’s you during exams.'
                     : 'Not verified yet — required before you can start an exam.'}
               </p>
             </div>
             {identityRegistered !== null && (
               <button
                 onClick={() => navigate('/register-face')}
-                className={identityRegistered ? 'text-xs font-medium px-3 py-1.5 rounded-full' : 'text-xs font-semibold px-3 py-1.5 rounded-full'}
+                className={`shrink-0 ${identityRegistered ? 'text-xs font-medium px-3 py-1.5 rounded-full' : 'text-xs font-semibold px-3 py-1.5 rounded-full'}`}
                 style={identityRegistered
                   ? { background: 'rgba(0,0,0,0.06)', color: 'var(--ink-soft)' }
                   : { background: '#B25000', color: 'white' }}

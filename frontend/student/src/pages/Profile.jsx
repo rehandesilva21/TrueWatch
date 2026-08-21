@@ -35,10 +35,10 @@ export default function Profile() {
           <div className="px-5 py-4 flex items-center justify-between">
             <div>
               <p className="text-sm font-medium">
-                {faceRegistered === null ? 'Checking\u2026' : faceRegistered ? 'Face registered' : 'Not registered'}
+                {faceRegistered === null ? 'Checking…' : faceRegistered ? 'Face registered' : 'Not registered'}
               </p>
               <p className="text-xs mt-0.5" style={{ color: 'var(--ink-soft)' }}>
-                Used to confirm it\u2019s you during exams
+                Used to confirm it's you during exams
               </p>
             </div>
             <span className="glass-pill" style={{

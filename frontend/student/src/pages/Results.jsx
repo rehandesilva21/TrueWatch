@@ -64,7 +64,7 @@ export default function Results() {
         ) : (
           <>
             {/* Stat cards */}
-            <div className={`grid gap-4 mb-6 ${avgGrade != null ? 'grid-cols-3' : 'grid-cols-2'}`}>
+            <div className={`grid grid-cols-2 gap-3 sm:gap-4 mb-6 ${avgGrade != null ? 'sm:grid-cols-3' : ''}`}>
               <div className="glass-panel p-5">
                 <p className="text-xs font-medium uppercase tracking-wide mb-2" style={{ color: 'var(--ink-soft)' }}>Total submitted</p>
                 <p className="text-3xl font-semibold" style={{ color: 'var(--accent)' }}>{results.length}</p>
@@ -91,7 +91,8 @@ export default function Results() {
                 <h2 className="font-semibold text-[15px]">Your grades</h2>
                 <span className="text-xs" style={{ color: 'var(--ink-soft)' }}>{results.length} exam{results.length !== 1 ? 's' : ''}</span>
               </div>
-              <table className="w-full">
+              <div className="overflow-x-auto">
+                <table className="w-full">
                 <thead>
                   <tr style={{ borderBottom: '1px solid rgba(0,0,0,0.06)' }}>
                     {['Exam', 'Submitted', 'Originality', 'Grade', 'Status'].map(h => (
@@ -139,6 +140,7 @@ export default function Results() {
                   ))}
                 </tbody>
               </table>
+              </div>
             </div>
           </>
         )}

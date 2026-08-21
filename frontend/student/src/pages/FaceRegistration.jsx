@@ -40,7 +40,7 @@ export default function FaceRegistration() {
     } catch (err) {
       console.error('Camera error:', err)
       if (err.name === 'NotAllowedError') {
-        setError('Camera permission was denied. Click the camera icon in your browser\u2019s address bar, allow access, then reload this page.')
+        setError('Camera permission was denied. Click the camera icon in your browser’s address bar, allow access, then reload this page.')
       } else if (err.name === 'NotFoundError') {
         setError('No camera was found. Check that a webcam is connected and not in use by another app.')
       } else if (err.name === 'NotReadableError') {
@@ -70,7 +70,7 @@ export default function FaceRegistration() {
       streamRef.current?.getTracks().forEach(t => t.stop())
       setStatus('done')
     } catch {
-      setError('Couldn\u2019t save your photo. Try again.')
+      setError('Couldn’t save your photo. Try again.')
       setStatus('captured')
     }
   }
@@ -81,9 +81,9 @@ export default function FaceRegistration() {
 
       <div className="w-full max-w-md">
         <div className="text-center mb-6">
-          <h1 className="text-2xl font-semibold tracking-tight">Verify it’s you</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">Verify it's you</h1>
           <p className="text-sm mt-1.5" style={{ color: 'var(--ink-soft)' }}>
-            This photo confirms your identity before every exam. It’s stored on our servers, never shared.
+            This photo confirms your identity before every exam. It's stored on our servers, never shared.
           </p>
         </div>
 
@@ -102,7 +102,7 @@ export default function FaceRegistration() {
                   <path d="M20 6L9 17l-5-5" stroke="#34C759" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
                 </svg>
               </div>
-              <p className="font-medium">You’re all set</p>
+              <p className="font-medium">You're all set</p>
               <p className="text-sm mt-1 mb-6" style={{ color: 'var(--ink-soft)' }}>Your identity is registered.</p>
               <button
                 onClick={() => navigate('/calibration', redirectTo ? { state: { redirectTo } } : undefined)}
@@ -137,10 +137,10 @@ export default function FaceRegistration() {
                   </div>
                 )}
                 {status === 'saving' && (
-                  <button disabled className="glass-btn-primary">Saving\u2026</button>
+                  <button disabled className="glass-btn-primary">Saving…</button>
                 )}
                 {status === 'checking' && (
-                  <p className="text-center text-sm" style={{ color: 'var(--ink-soft)' }}>Checking camera\u2026</p>
+                  <p className="text-center text-sm" style={{ color: 'var(--ink-soft)' }}>Checking camera…</p>
                 )}
               </div>
             </>

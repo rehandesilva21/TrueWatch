@@ -144,12 +144,12 @@ export default function Dashboard() {
             Hey, {user?.name?.split(' ')[0]}
           </h1>
           <p className="text-sm mt-1" style={{ color: 'var(--ink-soft)' }}>
-            Here’s what’s happening with your exams.
+            Here's what's happening with your exams.
           </p>
         </div>
 
         {/* Stat cards */}
-        <div className={`grid gap-4 mb-7 ${avgGrade != null ? 'grid-cols-4' : 'grid-cols-3'}`}>
+        <div className={`grid grid-cols-2 gap-3 sm:gap-4 mb-7 ${avgGrade != null ? 'md:grid-cols-4' : 'md:grid-cols-3'}`}>
           {[
             { label: 'Live now',        value: upcoming.length, accent: '#34C759' },
             { label: 'Total exams',     value: exams.length,    accent: 'var(--accent)' },
@@ -165,15 +165,15 @@ export default function Dashboard() {
 
         {/* Live exam banner */}
         {upcoming.length > 0 && (
-          <div className="glass-panel p-5 mb-6 flex items-center justify-between" style={{ background: 'rgba(52,199,89,0.08)' }}>
-            <div className="flex items-center gap-3">
-              <div className="w-2.5 h-2.5 rounded-full animate-pulse" style={{ background: '#34C759' }} />
-              <div>
-                <p className="font-medium text-sm">{upcoming[0].title} is live</p>
+          <div className="glass-panel p-5 mb-6 flex flex-wrap gap-3 items-center justify-between" style={{ background: 'rgba(52,199,89,0.08)' }}>
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="w-2.5 h-2.5 rounded-full animate-pulse shrink-0" style={{ background: '#34C759' }} />
+              <div className="min-w-0">
+                <p className="font-medium text-sm truncate">{upcoming[0].title} is live</p>
                 <p className="text-xs" style={{ color: 'var(--ink-soft)' }}>{upcoming[0].duration_mins} minutes</p>
               </div>
             </div>
-            <button onClick={() => navigate(`/exam/${upcoming[0].id}`)} className="glass-btn-primary" style={{ width: 'auto', padding: '10px 20px' }}>
+            <button onClick={() => navigate(`/exam/${upcoming[0].id}`)} className="glass-btn-primary shrink-0" style={{ width: 'auto', padding: '10px 20px' }}>
               Enter exam
             </button>
           </div>
@@ -197,16 +197,16 @@ export default function Dashboard() {
                 const relStart = e.status === 'draft' ? relativeStart(e.start_time) : null
                 return (
                   <div key={e.id}
-                       className="px-5 py-4 flex items-center justify-between transition-colors hover:bg-black/[0.02]"
+                       className="px-5 py-4 flex flex-wrap gap-3 items-center justify-between transition-colors hover:bg-black/[0.02]"
                        style={{ borderBottom: i < exams.length - 1 ? '1px solid rgba(0,0,0,0.05)' : 'none' }}>
-                    <div>
-                      <p className="font-medium text-sm">{e.title}</p>
+                    <div className="min-w-0">
+                      <p className="font-medium text-sm truncate">{e.title}</p>
                       <p className="text-xs mt-0.5" style={{ color: 'var(--ink-soft)' }}>
                         {e.start_time ? new Date(e.start_time).toLocaleString() : 'Schedule TBA'} · {e.duration_mins} min
                         {relStart && <span style={{ color: 'var(--accent-deep)' }}> · opens {relStart}</span>}
                       </p>
                     </div>
-                    <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-3 shrink-0">
                       {submittedExamIds.has(e.id) ? (
                         <span className="glass-pill" style={{ background: 'rgba(0,0,0,0.06)', color: 'var(--ink-soft)', border: 'none' }}>
                           ✓ Submitted
@@ -235,10 +235,10 @@ export default function Dashboard() {
               {gradeTrend.length >= 2 && <Sparkline values={gradeTrend} />}
             </div>
             {graded.slice(0, 3).map((r, i) => (
-              <div key={i} className="px-5 py-4 flex items-center justify-between transition-colors hover:bg-black/[0.02]"
+              <div key={i} className="px-5 py-4 flex gap-3 items-center justify-between transition-colors hover:bg-black/[0.02]"
                    style={{ borderBottom: i < 2 ? '1px solid rgba(0,0,0,0.05)' : 'none' }}>
-                <p className="font-medium text-sm">{r.exam_title}</p>
-                <span className="text-lg font-semibold" style={{ color: gradeColor(r.grade) }}>{r.grade}/100</span>
+                <p className="font-medium text-sm truncate min-w-0">{r.exam_title}</p>
+                <span className="text-lg font-semibold shrink-0" style={{ color: gradeColor(r.grade) }}>{r.grade}/100</span>
               </div>
             ))}
           </div>
