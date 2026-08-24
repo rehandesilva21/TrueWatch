@@ -1,9 +1,5 @@
 import os
-# MUST be the very first thing that runs, before any other import — this
-# environment variable only takes effect if set before a native library
-# reads it during its own initialization. Prevents an OpenMP-runtime
-# conflict between TensorFlow (audio CNN) and LightGBM in this same
-# process from aborting with a segmentation fault.
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import sys
@@ -22,18 +18,7 @@ import json
 from datetime import datetime, timezone
 
 def utcnow():
-    """
-    Timezone-naive UTC now — deliberately naive, not aware. MySQL
-    DATETIME columns store no timezone info, so any value read back
-    from the DB always comes back as a naive datetime. If this returned
-    an aware datetime instead, mixing a fresh utcnow() with a value
-    already loaded from the DB in the same request raises
-    'TypeError: can't subtract offset-naive and offset-aware datetimes'
-    the moment they're compared or subtracted — which is exactly what
-    happened in generate_ai_summary(). Still computed from true UTC
-    (avoids local-timezone bugs), just without the tzinfo marker, so it
-    matches what the database actually gives back.
-    """
+   
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 app      = Flask(__name__)
@@ -55,20 +40,7 @@ import numpy as np
 
 
 def bootstrap():
-    """
-    All heavyweight, side-effecting startup work — DB connection, audio
-    ensemble load+warmup, YOLO worker process start+warmup — lives here
-    instead of at bare module level. macOS's 'spawn' multiprocessing
-    start method re-imports this entire file fresh inside the child
-    process to reconstruct its namespace; if this initialization ran
-    unconditionally at module level, the child would re-run it too —
-    which is exactly what caused duplicated "Database connected..." log
-    lines and a "attempt to start a new process before bootstrapping
-    finished" error the first time the YOLO worker process was added.
-    Calling this only from inside `if __name__ == "__main__":` means the
-    child's re-import sees __name__ as '__mp_main__', not '__main__', so
-    it skips this function entirely instead of re-triggering it.
-    """
+    
     init_db(app)
 
     try:
@@ -1560,12 +1532,7 @@ def detect_object_snapshot():
 
 @app.route('/api/audio/classify', methods=['POST'])
 def classify_audio_clip():
-    """
-    Browser posts a short WAV clip (~2s) periodically. Runs it through the
-    trained CNN+LightGBM ensemble (paper/loud/silence/ambient only — whisper
-    and speech remain the continuous rule-based classifier's job client-side,
-    since ESC-50 has no true whisper class).
-    """
+   
     import base64, tempfile
     user, err = require_auth(roles=["student"])
     if err: return err
@@ -1598,6 +1565,59 @@ def classify_audio_clip():
             socketio.emit('incident', {**incident, "session_token": token, "student_id": ps["student_id"]})
 
     return jsonify({"label": label, "confidence": confidence})
+
+@app.route('/api/auth/change-password', methods=['POST'])
+def change_password():
+    """Self-service password change — requires the current password,
+    unlike the admin-side PUT /admin/users/<id> which can set a new
+    password without knowing the old one. This is the endpoint a logged-in
+    user (any role) uses to change their own password from Settings."""
+    user, err = require_auth()
+    if err: return err
+
+    data             = request.json or {}
+    current_password = data.get("current_password", "")
+    new_password     = data.get("new_password", "")
+
+    if not current_password or not new_password:
+        return jsonify({"error": "Current and new password are required"}), 400
+    if len(new_password) < 8:
+        return jsonify({"error": "New password must be at least 8 characters"}), 400
+    if not user.check_password(current_password):
+        return jsonify({"error": "Current password is incorrect"}), 401
+
+    user.set_password(new_password)
+    db.session.commit()
+    return jsonify({"status": "password changed"})
+
+# ──────────────────────────────────────────────────────────────
+# PREFERENCES
+# ──────────────────────────────────────────────────────────────
+# Lightweight, free-form per-user UI preferences (notification/sound
+# toggles, preferred camera/mic device IDs). Deliberately open to any
+# role, not just students — lecturer and admin portals can reuse the same
+# endpoint later rather than needing their own copy.
+
+@app.route('/api/preferences', methods=['GET'])
+def get_preferences():
+    user, err = require_auth()
+    if err: return err
+    return jsonify({"preferences": user.preferences or {}})
+
+
+@app.route('/api/preferences', methods=['PUT'])
+def update_preferences():
+    user, err = require_auth()
+    if err: return err
+
+    data = request.json or {}
+    current = dict(user.preferences or {})
+    current.update(data)
+    user.preferences = current
+
+    db.session.commit()
+    return jsonify({"status": "saved", "preferences": user.preferences})
+
 
 
 @socketio.on('connect')

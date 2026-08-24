@@ -175,26 +175,7 @@ class PlagiarismDetector:
                       f"continuing with TF-IDF + semantic only.")
 
     def analyze(self, file_path, use_semantic=True, extra_corpus=None, exclude_from_corpus=None):
-        """
-        Full plagiarism analysis pipeline.
-        Returns a detailed report dict.
-
-        extra_corpus: optional list of (name, cleaned_text) tuples to compare
-        against in addition to the standing disk corpus, without writing them
-        to disk. Used by the exam-wide recheck endpoint to cross-compare
-        every submission in one exam against every other submission from
-        that same exam, including ones submitted after this one — the
-        standing corpus alone only ever contains documents added *before*
-        this one, so two students submitting close together would otherwise
-        never get compared against each other.
-
-        exclude_from_corpus: optional standing-corpus filename to exclude
-        before comparing. Every submission gets added to the standing corpus
-        right after its own original check (see check_plagiarism() in
-        api.py), so re-checking that same file later would otherwise find
-        its own copy sitting in the corpus and report a false ~100% match
-        against itself.
-        """
+       
         print(f"\nAnalyzing: {os.path.basename(file_path)}")
         print("─" * 50)
 
@@ -222,13 +203,7 @@ class PlagiarismDetector:
                 "word_count":     word_count,
                 "sentence_count": len(sentences),
                 "originality":    100.0,
-                # Must be a real RiskLevel value ("LOW"/"MEDIUM"/"HIGH"/
-                # "CRITICAL") — check_plagiarism() in api.py constructs
-                # RiskLevel(report["risk_level"]) for the DB row, and a
-                # non-member string here throws a 500 at save time. Nothing
-                # empty-corpus-specific is at risk of being lost since the
-                # summary text below already explains why originality is
-                # 100% — there's simply nothing to compare against yet.
+               
                 "risk_level":     "LOW",
                 "tfidf_matches":  [],
                 "semantic_matches": [],

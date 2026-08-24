@@ -1,42 +1,15 @@
 // electron/main.js
-//
-// Electron main process for the TrueWatch student desktop app.
-//
-// WHY THIS FILE EXISTS AT ALL: the student portal is architecturally
-// different from the lecturer/admin portals (see Chapter 5, Section 5.1).
-// It runs as a single-role client with no RBAC switching, and — the whole
-// reason for this Electron conversion — it needs OS-level access that a
-// browser tab can never have: knowing WHICH application the student
-// switched to, not just that they switched away. A website is deliberately
-// and permanently blocked from seeing this by every browser's security
-// model; only a desktop process with real OS permissions can ask "what
-// window currently has focus" and get a real answer.
-//
-// IMPLEMENTATION NOTE: an earlier version of this file used the npm
-// package `active-win`, which wraps a compiled native binary per platform
-// (a Swift helper on macOS, a C# helper on Windows). That binary proved
-// unreliable in practice. This version instead directly ports the
-// approach already proven to work in the project's original Python
-// desktop prototype (modules/utils/tab_monitor.py): AppleScript via
-// `osascript` on macOS, a PowerShell/User32 call on Windows, and
-// xdotool/xprop on Linux — invoked directly via Node's child_process,
-// with no native compilation step at all.
-
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
 
 const isDev = !app.isPackaged;
 
-// The Vite dev server URL during development, vs. the built static files
-// once packaged. Keeping this as one constant makes the swap between the
-// two completely explicit rather than buried in conditional logic below.
 const DEV_SERVER_URL = 'http://localhost:5173';
 const PROD_INDEX_HTML = path.join(__dirname, '..', 'dist', 'index.html');
 
 let mainWindow = null;
-// Ensures the troubleshooting hint below prints once per app run, not on
-// every query, so it doesn't flood the console.
+
 let focusQueryWarned = false;
 
 function createWindow() {
@@ -47,11 +20,7 @@ function createWindow() {
     minHeight: 640,
     title: 'TrueWatch',
     webPreferences: {
-      // contextIsolation + a preload script is the only safe way to expose
-      // main-process capabilities to the renderer. Never set
-      // nodeIntegration: true here — that would give the React app (which
-      // ultimately renders content driven by exam data) full Node.js
-      // access, a real security hole for no benefit.
+     
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
@@ -71,7 +40,7 @@ function createWindow() {
   });
 }
 
-// ─── Focus / app-switch detection (OS-native, no compiled deps) ───────
+// app switch detection: the renderer can't ask the OS directly, so it asks the main process via IPC. The main process runs the platform-specific query and returns the result, or null if the query fails or the focused window is still our own app.
 
 function execFileAsync(cmd, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -82,10 +51,7 @@ function execFileAsync(cmd, args, options = {}) {
   });
 }
 
-// macOS — AppleScript via System Events, identical query to the Python
-// prototype's tab_monitor.py. Returns "AppName - WindowTitle", or just
-// "AppName" when the frontmost process has no accessible window title
-// (the AppleScript's own `on error` branch already handles that case).
+// macOS
 async function getFocusedWindowMac() {
   const script = `
     tell application "System Events"
@@ -105,9 +71,7 @@ async function getFocusedWindowMac() {
   return { appName: appName || raw, windowTitle: rest.join(' - ') || '' };
 }
 
-// Windows — PowerShell calling the same User32 GetForegroundWindow /
-// GetWindowText pair the Python prototype used via ctypes, just invoked
-// through PowerShell's Add-Type instead of Python's ctypes binding.
+// Windows — PowerShell calling the same User32 GetForegroundWindow 
 async function getFocusedWindowWin() {
   const script = `
     Add-Type @"
@@ -125,15 +89,11 @@ async function getFocusedWindowWin() {
     Write-Output $sb.ToString()
   `;
   const raw = await execFileAsync('powershell', ['-NoProfile', '-Command', script]);
-  // Windows window titles are typically "Document - AppName" or just
-  // "AppName" — there's no clean OS-level separation like macOS's
-  // process-name-vs-window-title, so the whole string is used as the
-  // effective app name here, same as the Python prototype did.
+ // windows
   return { appName: raw || 'Unknown application', windowTitle: raw || '' };
 }
 
-// Linux — xdotool first, xprop as a fallback, identical to the Python
-// prototype's two-step approach.
+// Linux 
 async function getFocusedWindowLinux() {
   try {
     const raw = await execFileAsync('xdotool', ['getactivewindow', 'getwindowname']);
@@ -173,22 +133,14 @@ async function getFocusedWindowInfo() {
   }
 }
 
-// Names that mean "still our own app" and should NOT be reported as a
-// switch. 'electron' covers the unpackaged dev-mode process name; the
-// second entry adapts automatically to whatever productName the app is
-// built with (e.g. "TrueWatch" once packaged via electron-builder), so
-// this stays correct after packaging without needing a code change.
+
 function isSelfAppName(name) {
   if (!name) return false;
   const lower = name.toLowerCase();
   return lower === 'electron' || lower === app.getName().toLowerCase();
 }
 
-// Invoked (request/response, not fire-and-forget) by the renderer at the
-// exact moment a blur/visibilitychange fires. Returns null when the OS
-// query fails AND when the freshly-focused window turns out to still be
-// our own app — either way, the renderer falls back to its generic
-// message rather than naming an app that isn't a real switch.
+
 ipcMain.handle('truewatch:get-focused-app', async () => {
   const info = await getFocusedWindowInfo();
   if (!info) return null;

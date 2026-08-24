@@ -10,12 +10,12 @@ class UserRole(PyEnum):
     STUDENT  = "student"
 
 class ExamType(PyEnum):
-    MCQ      = "mcq"       # question-based online exam — full behavioral monitoring
-    DOCUMENT = "document"  # paper/essay submitted as a file — plagiarism check only, no webcam/mic monitoring
-
+    MCQ      = "mcq"       
+    DOCUMENT = "document"  
+    
 class AssignmentType(PyEnum):
-    INDIVIDUAL = "individual"  # lecturer enrolls specific students one by one
-    BATCH      = "batch"       # exam is assigned to every student in a batch (class/cohort)
+    INDIVIDUAL = "individual"  
+    BATCH      = "batch"       
 
 class ExamStatus(PyEnum):
     DRAFT     = "draft"
@@ -71,6 +71,7 @@ class User(db.Model):
     batch_id     = db.Column(db.Integer,     db.ForeignKey("batches.id"), nullable=True)
     is_active    = db.Column(db.Boolean,     default=True)
     created_at   = db.Column(db.DateTime,    default=datetime.utcnow)
+    preferences  = db.Column(db.JSON,        nullable=True, default=dict)
 
     exams_created    = db.relationship("Exam",               backref="creator",  lazy=True)
     enrollments      = db.relationship("ExamEnrollment",     backref="student",  lazy=True)
@@ -144,7 +145,7 @@ class ExamEnrollment(db.Model):
     enrolled_at = db.Column(db.DateTime,   default=datetime.utcnow)
 
 
-# ─── Sessions ──────────────────────────────────────────────────
+#  Sessions 
 class Session(db.Model):
     __tablename__ = "sessions"
     id            = db.Column(db.Integer,  primary_key=True)
@@ -156,7 +157,7 @@ class Session(db.Model):
     risk_score    = db.Column(db.Integer,  default=0)
     result        = db.Column(db.Enum(SessionResult), default=SessionResult.PENDING)
     ai_summary    = db.Column(db.Text,     nullable=True)
-    auto_score    = db.Column(db.Float,    nullable=True)  # auto-graded MCQ score out of 100, null if no MCQ questions
+    auto_score    = db.Column(db.Float,    nullable=True)  
 
     incidents          = db.relationship("Incident",          backref="session", lazy=True)
     plagiarism_reports = db.relationship("PlagiarismReport",  backref="session", lazy=True)
@@ -169,19 +170,7 @@ class Session(db.Model):
         return summary
 
     def generate_ai_summary(self, incident_types=None):
-        """
-        incident_types: optional list of incident type strings (e.g. from
-        the live IncidentLogger at the moment the session is stopped).
-        When given, the summary is built from that list directly instead
-        of re-querying self.incidents — this guarantees the text always
-        matches the risk_score, which is computed from that same live
-        list. Without this, a summary generated in the same request that
-        just wrote those incidents to the DB could see a stale/empty
-        `self.incidents` relationship and report "no suspicious activity"
-        even though risk_score was already high — exactly backwards.
-        If not given, falls back to self.incidents (e.g. for regenerating
-        a summary later, outside the stop-session flow).
-        """
+       
         if incident_types is not None:
             summary = {}
             for t in incident_types:
@@ -191,12 +180,7 @@ class Session(db.Model):
 
         duration = ""
         if self.ended_at and self.started_at:
-            # MySQL DATETIME columns don't store timezone info, so a
-            # datetime just loaded from the DB comes back naive, while one
-            # freshly assigned in this same request via utcnow() is still
-            # timezone-aware — subtracting an aware datetime from a naive
-            # one raises TypeError. Normalize both to naive (both are UTC
-            # either way) before doing arithmetic.
+            
             end   = self.ended_at.replace(tzinfo=None)   if self.ended_at.tzinfo   else self.ended_at
             start = self.started_at.replace(tzinfo=None) if self.started_at.tzinfo else self.started_at
             mins = int((end - start).total_seconds() / 60)

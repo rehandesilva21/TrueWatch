@@ -6,21 +6,25 @@ const LEFT_IRIS = 473, LEFT_EYE_L = 263, LEFT_EYE_R = 362
 const NOSE_TIP = 1, LEFT_EAR = 234, RIGHT_EAR = 454
 const UPPER_LIP = 13, LOWER_LIP = 14, LIP_L = 61, LIP_R = 291
 
-function gazeRatio(landmarks) {
+// Exported specifically so these pure, dependency-free calculations can
+// be unit-tested in isolation (Chapter 7, Code-Level Testing) without
+// needing to mock MediaPipe or a live video element — this changes
+// nothing about how useFaceMonitor() itself uses them internally below.
+export function gazeRatio(landmarks) {
   const iris = landmarks[LEFT_IRIS], eyeL = landmarks[LEFT_EYE_L], eyeR = landmarks[LEFT_EYE_R]
   const width = Math.abs(eyeR.x - eyeL.x)
   if (width === 0) return 0.5
   return (iris.x - eyeL.x) / width
 }
 
-function headPose(landmarks) {
+export function headPose(landmarks) {
   const nose = landmarks[NOSE_TIP], left = landmarks[LEFT_EAR], right = landmarks[RIGHT_EAR]
   const leftDist = Math.abs(nose.x - left.x), rightDist = Math.abs(nose.x - right.x)
   const total = leftDist + rightDist
   return total === 0 ? 0.5 : leftDist / total
 }
 
-function lipDistance(landmarks) {
+export function lipDistance(landmarks) {
   const upper = landmarks[UPPER_LIP], lower = landmarks[LOWER_LIP]
   const left = landmarks[LIP_L], right = landmarks[LIP_R]
   const mouthWidth = Math.abs(right.x - left.x)
@@ -45,19 +49,31 @@ export function useFaceMonitor() {
   const load = useCallback(async () => {
     if (landmarkerRef.current) return
     try {
-      const filesetResolver = await FilesetResolver.forVisionTasks(
-        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
-      )
+      // Both the WASM runtime and the model weights are now served from
+      // this app's own public/ folder rather than external CDNs
+      // (jsdelivr for the WASM runtime, Google Cloud Storage for the
+      // model file). Previously, every single exam session depended on
+      // the student's browser successfully reaching two different
+      // third-party CDNs at the exact moment the exam started — a
+      // genuine single point of failure with no relationship to
+      // TrueWatch's own reliability. The WASM files ship inside the
+      // already-installed @mediapipe/tasks-vision npm package itself
+      // (copied into public/mediapipe-wasm/ once, not downloaded at
+      // runtime); the model file is downloaded once manually and
+      // committed into public/models/ — see README for the exact
+      // download step, since MediaPipe doesn't publish model weights
+      // through npm.
+      const filesetResolver = await FilesetResolver.forVisionTasks('/mediapipe-wasm')
       landmarkerRef.current = await FaceLandmarker.createFromOptions(filesetResolver, {
         baseOptions: {
-          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+          modelAssetPath: '/models/face_landmarker.task',
           delegate: 'CPU',   // GPU delegate fails on many Windows setups
         },
         runningMode: 'VIDEO',
         numFaces: 2,
       })
       setReady(true)
-      console.log('[FaceMonitor] Loaded successfully')
+      console.log('[FaceMonitor] Loaded successfully (self-hosted, no CDN dependency)')
     } catch (err) {
       console.error('[FaceMonitor] Failed to load:', err.name, err.message)
       throw err

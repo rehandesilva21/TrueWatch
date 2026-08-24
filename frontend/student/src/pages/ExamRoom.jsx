@@ -472,7 +472,18 @@ export default function ExamRoom() {
       if (endpoint === '/object/detect') {
         lastObjectDetectedRef.current = (res.data.detections?.length ?? 0) > 0
         if (res.data.detections?.length) {
-          res.data.detections.forEach(d => logIncident('PROHIBITED_OBJECT', d.confidence, `${d.class} detected`))
+          res.data.detections.forEach(d => {
+            // in_use comes from the backend's hand-proximity check
+            // (Chapter 6, Section 6.3.5) — distinguishes an object merely
+            // visible in frame from one the student is actively holding,
+            // which is meaningfully more suspicious and worth the lecturer
+            // seeing as a distinct, specific detail rather than an
+            // identical "object detected" message either way.
+            const details = d.in_use
+              ? `${d.class} actively held`
+              : `${d.class} visible (not in use)`
+            logIncident('PROHIBITED_OBJECT', d.confidence, details)
+          })
         }
       }
     } catch (err) {
