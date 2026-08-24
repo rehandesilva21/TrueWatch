@@ -54,6 +54,7 @@ reports/
 *.tmp
 *.temp
 venv/
+venv-test/
 
 __pycache__/
 *.py[cod]

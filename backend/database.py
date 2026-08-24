@@ -7,8 +7,15 @@ import json
 db = SQLAlchemy()
 
 def init_db(app):
-    app.config['SQLALCHEMY_DATABASE_URI'] = (
-        'mysql+pymysql://root:@localhost/truewatch'
+    # TRUEWATCH_DB_URI lets the database target be overridden without
+    # code changes — used specifically by the automated test suite
+    # (Chapter 7) to point the app at an isolated in-memory SQLite
+    # database instead of the real MySQL instance, so tests never touch
+    # production/development data and can run without a MySQL server
+    # present at all. Falls back to the original hardcoded MySQL URI for
+    # normal application use, so this is purely additive.
+    app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
+        'TRUEWATCH_DB_URI', 'mysql+pymysql://root:@localhost/truewatch'
     )
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     db.init_app(app)

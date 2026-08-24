@@ -6,13 +6,6 @@ const N_FEATURES    = 10
 const LSTM_UNITS     = 32
 const MODEL_JSON_URL = '/models/fusion_lstm/model.json'
 
-// Must match modules/fusion/feature_extractor.py's FEATURE_NAMES order
-// exactly — the model was trained on this specific column order, so any
-// mismatch here silently produces meaningless predictions rather than an
-// error.
-// [gaze_deviation, head_deviation, lip_movement, absent_flag,
-//  multi_face_flag, audio_severity, audio_alert_flag, identity_mismatch,
-//  object_in_use, tab_switch_flag]
 
 const AUDIO_SEVERITY = {
   silence: 0.0, ambient: 0.1, whisper: 0.5,
@@ -20,17 +13,7 @@ const AUDIO_SEVERITY = {
 }
 
 export function useFusionModel() {
-  // Raw named tensors ({ 'sequential/lstm/kernel': Tensor, ... }), not a
-  // tf.LayersModel — we deliberately never call tf.loadLayersModel() or
-  // touch modelTopology at all. That code path kept failing on this
-  // specific file's Keras-3-vs-tfjs serialization mismatches (InputLayer
-  // key naming, LSTM cell nesting, and a further shape/byte-alignment
-  // issue after that). tf.io.loadWeights() only needs the
-  // weightsManifest + the raw .bin shard bytes — which we've already
-  // confirmed load correctly — so this sidesteps every one of those
-  // compatibility issues by construction. The cost: the LSTM + Dense
-  // forward pass has to be implemented by hand below, since there's no
-  // LayersModel to run it for us.
+
   const weightsRef = useRef(null)
   const windowRef  = useRef([])
   const [ready, setReady] = useState(false)
@@ -45,9 +28,6 @@ export function useFusionModel() {
       const weights = await tf.io.loadWeights(modelJson.weightsManifest, basePath)
       weightsRef.current = weights
 
-      // Fail loudly here, with the exact missing/renamed variable, rather
-      // than silently producing garbage predictions later if something's
-      // still off with the manifest.
       const required = [
         'sequential/lstm/kernel', 'sequential/lstm/recurrent_kernel', 'sequential/lstm/bias',
         'sequential/dense/kernel', 'sequential/dense/bias',
@@ -95,23 +75,6 @@ export function useFusionModel() {
     return windowRef.current.length === WINDOW_SIZE
   }, [])
 
-  // Hand-written forward pass: LSTM(32) -> Dense(16, relu) -> Dense(1, sigmoid).
-  // Dropout layers are omitted entirely — they're identity operations at
-  // inference time (only active during training), so skipping them is
-  // exactly correct, not an approximation.
-  //
-  // Implements the standard Keras LSTM cell equations directly, run
-  // manually for each of the 15 timesteps in the window:
-  //   z = x_t @ kernel + h_{t-1} @ recurrent_kernel + bias      [1, 4*units]
-  //   [z_i, z_f, z_c, z_o] = split(z, 4)   (Keras's fixed gate order: i, f, c, o)
-  //   i = sigmoid(z_i); f = sigmoid(z_f); c~ = tanh(z_c); o = sigmoid(z_o)
-  //   c_t = f * c_{t-1} + i * c~
-  //   h_t = o * tanh(c_t)
-  // This gate order and kernel/recurrent_kernel shape convention
-  // ((input_dim, 4*units) and (units, 4*units) respectively) is a stable
-  // Keras public contract that hasn't changed across versions, so this
-  // part of the reconstruction should be reliable regardless of which
-  // Keras version originally trained/saved the model.
   const predict = useCallback(() => {
     const weights = weightsRef.current
     if (!weights || windowRef.current.length < WINDOW_SIZE) return null

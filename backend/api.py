@@ -67,7 +67,7 @@ def bootstrap():
 
 # ─── Global proctoring state ───────────────────────────────────
 proctoring_sessions = {}
-_token_store        = {}
+_token_store        = {}  # token → user id (see require_auth for why not the User object itself)
 
 # ─── Native-model concurrency locks ─────────────────────────────
 _object_detector_lock = threading.Lock()
@@ -79,8 +79,26 @@ _plagiarism_lock       = threading.Lock()
 
 def require_auth(roles=None):
     token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    user  = _token_store.get(token)
-    if not user:
+    user_id = _token_store.get(token)
+    if not user_id:
+        return None, (jsonify({"error": "Unauthorized"}), 401)
+    # Re-fetch on every request rather than returning a cached object.
+    # _token_store used to hold the live SQLAlchemy User instance
+    # directly; that instance becomes DETACHED from its session almost
+    # immediately after the login request that created it completes
+    # (Flask-SQLAlchemy tears down/removes the scoped session at the end
+    # of every request by default). A later request mutating that
+    # detached object (e.g. change-password calling user.set_password()
+    # then db.session.commit()) silently commits nothing, because the
+    # detached object was never part of the CURRENT request's session —
+    # confirmed directly via an automated test that changed a password,
+    # then failed to log in with the new one (Chapter 7). Re-querying by
+    # ID here guarantees the returned object is always attached to the
+    # current request's own session, and also means role/is_active
+    # changes made by an admin take effect on a user's very next
+    # request rather than only after they log in again.
+    user = db.session.get(User, user_id)
+    if not user or not user.is_active:
         return None, (jsonify({"error": "Unauthorized"}), 401)
     if roles and user.role.value not in roles:
         return None, (jsonify({"error": "Forbidden"}), 403)
@@ -106,7 +124,7 @@ def login():
         return jsonify({"error": "Invalid email or password"}), 401
 
     token = secrets.token_hex(32)
-    _token_store[token] = user
+    _token_store[token] = user.id
 
     return jsonify({"token": token, "user": user.to_dict()})
 
@@ -1684,4 +1702,3 @@ if __name__ == "__main__":
     print("  Admin:        GET  /api/admin/users")
     print("")
     socketio.run(app, host='0.0.0.0', port=5001, debug=False)
-    
